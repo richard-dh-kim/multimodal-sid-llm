@@ -68,32 +68,30 @@ def add_temporal_splits(
             )
         )
 
+    # Build last_ts dict via pyarrow group_by (avoids Table.join, which doesn't
+    # support list-typed columns like `categories: list<string>` on items).
     asins = interactions.column("parent_asin")
     ts = interactions.column("timestamp_ms")
-    df = pa.Table.from_arrays([asins, ts], names=["parent_asin", "timestamp_ms"])
-    # group_by max
-    last_ts = df.group_by("parent_asin").aggregate([("timestamp_ms", "max")])
-    # join onto items (NOTE: pyarrow joins do not preserve row order; we sort below)
-    joined = items.join(last_ts, keys="parent_asin", join_type="left outer")
+    inter_df = pa.Table.from_arrays([asins, ts], names=["parent_asin", "timestamp_ms"])
+    last_ts = inter_df.group_by("parent_asin").aggregate([("timestamp_ms", "max")])
+    last_ts_dict: dict[str, int] = dict(zip(
+        last_ts.column("parent_asin").to_pylist(),
+        last_ts.column("timestamp_ms_max").to_pylist(),
+    ))
 
-    last_ts_col = joined.column("timestamp_ms_max").to_pylist()
-    if not last_ts_col:
-        return _maybe_sort_by_item_id(
-            joined.append_column(
-                "split", pa.array(["train"] * joined.num_rows, type=pa.string())
-            )
-        )
+    item_asins = items.column("parent_asin").to_pylist()
+    last_ts_per_item = [last_ts_dict.get(a) for a in item_asins]
 
-    valid_ts = [t for t in last_ts_col if t is not None and t > 0]
+    valid_ts = [t for t in last_ts_per_item if t is not None and t > 0]
     if not valid_ts:
-        splits = ["train"] * len(last_ts_col)
+        splits = ["train"] * len(last_ts_per_item)
     else:
         global_max = max(valid_ts)
         ms_per_day = 24 * 60 * 60 * 1000
         test_cutoff = global_max - cfg.test_window_days * ms_per_day
         val_cutoff = test_cutoff - cfg.val_window_days * ms_per_day
-        splits: list[str] = []
-        for t in last_ts_col:
+        splits = []
+        for t in last_ts_per_item:
             if t is None or t <= 0:
                 splits.append("train")
             elif t > test_cutoff:
@@ -104,7 +102,7 @@ def add_temporal_splits(
                 splits.append("train")
 
     return _maybe_sort_by_item_id(
-        joined.append_column("split", pa.array(splits, type=pa.string()))
+        items.append_column("split", pa.array(splits, type=pa.string()))
     )
 
 
