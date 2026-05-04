@@ -8,8 +8,6 @@ full image.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
 
 import torch
 from PIL import Image
@@ -79,7 +77,7 @@ class GroundingDinoCropper:
         results = self.processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
-            box_threshold=0.05,  # post-process keeps low-conf boxes; we filter later
+            threshold=0.05,  # post-process keeps low-conf boxes; we filter later
             text_threshold=0.05,
             target_sizes=target_sizes,
         )
