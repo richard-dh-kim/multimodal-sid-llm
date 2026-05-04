@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Data — never committed (re-derivable from the download scripts)
+data/
+checkpoints/
+
+# Tooling
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.pdf
+*.HEIC
+*.heic
+*.jpg
+!docs/**/*.jpg
+!demo/assets/*.jpg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Wandb
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
