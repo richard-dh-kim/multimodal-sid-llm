@@ -43,16 +43,29 @@ def add_image_paths(items: pa.Table, images_dir: Path) -> pa.Table:
     return items
 
 
+def _maybe_sort_by_item_id(table: pa.Table) -> pa.Table:
+    if "item_id" in table.column_names:
+        return table.sort_by("item_id")
+    return table
+
+
 def add_temporal_splits(
     items: pa.Table, interactions: pa.Table, cfg: SplitConfig
 ) -> pa.Table:
     """For each item, compute its 'last interaction timestamp' across all users.
     Items split by their last-interaction date relative to the global max timestamp.
+    Requires `items` to have a 'parent_asin' string column.
+    Returns a table sorted by item_id (if present) so row N has item_id=N.
     """
+    if "parent_asin" not in items.column_names:
+        raise ValueError("items table must have a 'parent_asin' column")
+
     if interactions.num_rows == 0:
         # No interactions → all train
-        return items.append_column(
-            "split", pa.array(["train"] * items.num_rows, type=pa.string())
+        return _maybe_sort_by_item_id(
+            items.append_column(
+                "split", pa.array(["train"] * items.num_rows, type=pa.string())
+            )
         )
 
     asins = interactions.column("parent_asin")
@@ -60,13 +73,15 @@ def add_temporal_splits(
     df = pa.Table.from_arrays([asins, ts], names=["parent_asin", "timestamp_ms"])
     # group_by max
     last_ts = df.group_by("parent_asin").aggregate([("timestamp_ms", "max")])
-    # join onto items
+    # join onto items (NOTE: pyarrow joins do not preserve row order; we sort below)
     joined = items.join(last_ts, keys="parent_asin", join_type="left outer")
 
     last_ts_col = joined.column("timestamp_ms_max").to_pylist()
     if not last_ts_col:
-        return joined.append_column(
-            "split", pa.array(["train"] * joined.num_rows, type=pa.string())
+        return _maybe_sort_by_item_id(
+            joined.append_column(
+                "split", pa.array(["train"] * joined.num_rows, type=pa.string())
+            )
         )
 
     valid_ts = [t for t in last_ts_col if t is not None and t > 0]
@@ -88,7 +103,9 @@ def add_temporal_splits(
             else:
                 splits.append("train")
 
-    return joined.append_column("split", pa.array(splits, type=pa.string()))
+    return _maybe_sort_by_item_id(
+        joined.append_column("split", pa.array(splits, type=pa.string()))
+    )
 
 
 @click.command()

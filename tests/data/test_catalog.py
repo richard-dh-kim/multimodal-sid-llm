@@ -56,3 +56,24 @@ def test_add_temporal_splits_uses_interaction_timestamps():
     splits = out.column("split").to_pylist()
     assert set(splits) <= {"train", "val", "test"}
     assert all(s == "train" or s == "val" or s == "test" for s in splits)
+
+
+def test_add_temporal_splits_preserves_item_order():
+    """Regression test: pyarrow's Table.join does not preserve row order.
+    add_temporal_splits must restore ascending item_id order."""
+    interactions = pa.Table.from_pylist([
+        {"parent_asin": "Z", "timestamp_ms": 1000},  # last alphabetically but maps to item 0
+        {"parent_asin": "A", "timestamp_ms": 2000},  # first alphabetically, maps to item 2
+        {"parent_asin": "M", "timestamp_ms": 3000},  # middle, maps to item 1
+    ])
+    items = pa.Table.from_pylist([
+        {"item_id": 0, "parent_asin": "Z"},
+        {"item_id": 1, "parent_asin": "M"},
+        {"item_id": 2, "parent_asin": "A"},
+    ])
+    cfg = SplitConfig(test_window_days=1, val_window_days=1)
+    out = add_temporal_splits(items, interactions, cfg)
+    # row order must match input item_id order
+    assert out.column("item_id").to_pylist() == [0, 1, 2]
+    # parent_asin must still align with item_id correctly
+    assert out.column("parent_asin").to_pylist() == ["Z", "M", "A"]
