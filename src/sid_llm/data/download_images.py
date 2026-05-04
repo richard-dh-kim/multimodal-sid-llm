@@ -30,7 +30,10 @@ def derive_item_id_from_row_index(row_idx: int) -> int:
 
 
 def image_path_for_item(images_dir: Path, item_id: int) -> Path:
-    """Shard files into 1000 directories (000..999) by first 3 digits of zero-padded id."""
+    """Shard files into <=1000 directories. ids < 1000 go in shard f"{id:03d}";
+    ids >= 1000 go in shard f"{id // 1000:03d}". Caps at id < 10^6.
+    Examples: id=0 → "000/0.jpg", id=10 → "010/10.jpg", id=12345 → "012/12345.jpg".
+    """
     if item_id < 1000:
         shard = f"{item_id:03d}"
     else:
@@ -59,26 +62,29 @@ async def _download_one(
 
     last_error = ""
     for attempt in range(RETRY_ATTEMPTS):
+        sleep_after = 0.0
         try:
             async with semaphore:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)) as resp:
                     if resp.status >= 500:
                         last_error = f"HTTP {resp.status}"
-                        await asyncio.sleep(RETRY_BACKOFF ** attempt)
-                        continue
-                    if resp.status >= 400:
+                        sleep_after = RETRY_BACKOFF ** attempt
+                    elif resp.status >= 400:
                         return (item_id, False, f"HTTP {resp.status}")
-                    body = await resp.read()
-                    if len(body) < 100:
-                        return (item_id, False, f"too small ({len(body)} bytes)")
-                    out_path.write_bytes(body)
-                    return (item_id, True, "ok")
+                    else:
+                        body = await resp.read()
+                        if len(body) < 100:
+                            return (item_id, False, f"too small ({len(body)} bytes)")
+                        out_path.write_bytes(body)
+                        return (item_id, True, "ok")
         except asyncio.TimeoutError:
             last_error = "timeout"
-            await asyncio.sleep(RETRY_BACKOFF ** attempt)
+            sleep_after = RETRY_BACKOFF ** attempt
         except aiohttp.ClientError as e:
             last_error = f"client_error: {type(e).__name__}"
-            await asyncio.sleep(RETRY_BACKOFF ** attempt)
+            sleep_after = RETRY_BACKOFF ** attempt
+        if sleep_after:
+            await asyncio.sleep(sleep_after)
 
     return (item_id, False, last_error)
 
