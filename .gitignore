@@ -7,8 +7,8 @@ __pycache__/
 venv/
 
 # Data — never committed (re-derivable from the download scripts)
-data/
-checkpoints/
+/data/
+/checkpoints/
 
 # Tooling
 .ruff_cache/
