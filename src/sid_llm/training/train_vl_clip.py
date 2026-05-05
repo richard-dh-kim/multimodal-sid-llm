@@ -5,12 +5,42 @@ from pathlib import Path
 
 import click
 import lightning as L
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
 from sid_llm.models.vl_clip import VLClipLightning
 from sid_llm.training.datasets import VLClipItemDataset, make_collate_fn
+
+
+class HFSavePerEpoch(Callback):
+    """Save the underlying HF CLIPModel + processor at the end of every train epoch.
+
+    Uses HF's safetensors format which is robust to the torch.save bf16/zipfile
+    alignment bug we hit on Windows. The latest version is at `<ckpt_dir>/hf_latest/`;
+    a copy keyed by val_recall_at_10 (when present) is at `<ckpt_dir>/hf_best/`.
+    """
+
+    def __init__(self, ckpt_dir: Path):
+        super().__init__()
+        self.ckpt_dir = Path(ckpt_dir)
+        self._best_recall: float = -1.0
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        latest = self.ckpt_dir / "hf_latest"
+        latest.mkdir(parents=True, exist_ok=True)
+        pl_module.model.save_pretrained(str(latest))
+        pl_module.processor.save_pretrained(str(latest))
+        cur = trainer.callback_metrics.get("val_recall_at_10")
+        if cur is None:
+            return
+        cur_v = float(cur.detach().cpu()) if hasattr(cur, "detach") else float(cur)
+        if cur_v > self._best_recall:
+            self._best_recall = cur_v
+            best = self.ckpt_dir / "hf_best"
+            best.mkdir(parents=True, exist_ok=True)
+            pl_module.model.save_pretrained(str(best))
+            pl_module.processor.save_pretrained(str(best))
 
 
 @click.command()
@@ -73,14 +103,20 @@ def main(
     steps_per_epoch = max(1, len(train_loader))
     model.hparams.total_steps = steps_per_epoch * epochs
 
+    # NOTE: save_weights_only=True avoids a Windows bf16/zipfile alignment bug
+    # in torch.save when serializing the optimizer state of a 151M-param CLIPModel.
+    # We still save the HF-format snapshot at the end of fit() for downstream use.
     callbacks = [
         EarlyStopping(monitor="val_recall_at_10", mode="max", patience=patience, verbose=True),
         ModelCheckpoint(
             dirpath=str(ckpt_dir),
             filename="vl_clip-epoch{epoch:02d}-r10{val_recall_at_10:.4f}",
-            monitor="val_recall_at_10", mode="max", save_top_k=1, save_last=True,
+            monitor="val_recall_at_10", mode="max",
+            save_top_k=1, save_last=True,
+            save_weights_only=True,
             auto_insert_metric_name=False,
         ),
+        HFSavePerEpoch(ckpt_dir),
     ]
     logger = CSVLogger(save_dir="logs", name="vl_clip")
 
