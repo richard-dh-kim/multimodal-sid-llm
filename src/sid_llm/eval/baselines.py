@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import json
-from itertools import groupby
 from pathlib import Path
 
 import click
 import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 
 from sid_llm.eval.metrics import ndcg_at_k, recall_at_k
@@ -15,47 +15,109 @@ from sid_llm.eval.metrics import ndcg_at_k, recall_at_k
 def mips_topk(
     queries: np.ndarray, catalog_emb: np.ndarray,
     catalog_item_ids: list[int], k: int,
+    chunk_size: int = 1024,
 ) -> list[list[int]]:
-    """Brute-force MIPS. queries [N,D] x catalog_emb.T [D,M] -> [N,M]; take top-K per row."""
-    scores = queries @ catalog_emb.T  # [N, M]
-    topk_idx = np.argpartition(-scores, kth=min(k, scores.shape[1] - 1), axis=1)[:, :k]
-    rows = np.arange(len(queries))[:, None]
-    topk_sorted = topk_idx[rows, np.argsort(-scores[rows, topk_idx])]
-    return [[catalog_item_ids[i] for i in row] for row in topk_sorted]
+    """Brute-force MIPS. Chunked over queries to bound peak memory.
+    For each chunk: scores [chunk, M] then top-K per row; concatenate chunks.
+
+    queries: [N, D]; catalog_emb: [M, D]; returns list of K item_ids per query.
+    """
+    n = len(queries)
+    if n == 0:
+        return []
+    cat_t = catalog_emb.T  # [D, M], not copied per chunk
+    m = catalog_emb.shape[0]
+    k_eff = min(k, m)
+    out: list[list[int]] = []
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        scores = queries[start:end] @ cat_t  # [chunk, M]
+        # argpartition for unordered top-K, then sort the K indices by score
+        part_kth = min(k_eff, scores.shape[1] - 1)
+        topk_idx = np.argpartition(-scores, kth=part_kth, axis=1)[:, :k_eff]
+        rows = np.arange(end - start)[:, None]
+        topk_sorted = topk_idx[rows, np.argsort(-scores[rows, topk_idx])]
+        for row in topk_sorted:
+            out.append([catalog_item_ids[i] for i in row])
+    return out
 
 
 def _build_user_history_queries(
-    interactions: list[dict],
-    catalog_emb_lookup: dict[int, np.ndarray],
+    interactions_path: Path,
+    asin_to_iid: dict[str, int],
+    catalog_emb_arr: np.ndarray,
+    iid_to_emb_idx: dict[int, int],
+    max_queries: int,
+    min_history: int,
+    seed: int,
 ) -> tuple[np.ndarray, list[int]]:
-    """Leave-last-out per user. Input = mean of user's prior item embeddings;
-    target = last item. Skips users with <2 catalog-resolved events.
+    """Leave-last-out per user. Memory-efficient via pandas + chunked aggregation.
 
-    Simple v0 query construction; replaced in M3 with the real SID-LLM input.
+    For each eligible user (>= min_history+1 catalog-resolved events):
+      input  = mean of all-but-last item embeddings, L2-normalized
+      target = item_id of last event
+
+    Eligible users are randomly sampled (seeded) down to `max_queries` to bound
+    eval cost. The full 11.8M-interaction set easily exceeds 4 GB if dict-listed.
+
+    v0 query construction; replaced in M3 by the real SID-LLM input.
     """
-    interactions.sort(key=lambda r: (r["user_id"], r["timestamp_ms"]))
+    print(f"  loading interactions via pyarrow ...")
+    df = pq.read_table(str(interactions_path), columns=["user_id", "parent_asin", "timestamp_ms"]).to_pandas()
+    print(f"  {len(df):,} raw interactions, {df['user_id'].nunique():,} unique users")
 
+    # Drop rows for items NOT in our catalog.
+    df = df[df["parent_asin"].isin(asin_to_iid.keys())].copy()
+    df["item_id"] = df["parent_asin"].map(asin_to_iid).astype("int64")
+    print(f"  {len(df):,} interactions after catalog filter")
+
+    # Sort by (user_id, timestamp) so the last row per user_id is the held-out target.
+    df = df.sort_values(["user_id", "timestamp_ms"], kind="mergesort")
+
+    # Drop users with too few interactions (need at least min_history+1: history + target).
+    counts = df.groupby("user_id", sort=False).size()
+    eligible_users = counts[counts >= min_history + 1].index
+    df = df[df["user_id"].isin(eligible_users)].copy()
+    print(f"  {len(eligible_users):,} eligible users (>= {min_history + 1} events)")
+
+    # Random sample of users for tractable eval.
+    rng = np.random.default_rng(seed)
+    if len(eligible_users) > max_queries:
+        sampled_users = rng.choice(eligible_users.values, size=max_queries, replace=False)
+        df = df[df["user_id"].isin(sampled_users)].copy()
+        print(f"  sampled down to {max_queries:,} users for eval")
+
+    # For each user: target = last row, history_iids = all but last.
+    df = df.sort_values(["user_id", "timestamp_ms"], kind="mergesort")
+    df["row_in_user"] = df.groupby("user_id", sort=False).cumcount()
+    user_lengths = df.groupby("user_id", sort=False).size().rename("n_events")
+    df = df.join(user_lengths, on="user_id")
+    df["is_target"] = df["row_in_user"] == (df["n_events"] - 1)
+
+    # Translate item_id -> embedding row index in catalog_emb_arr; drop unresolved.
+    df["emb_idx"] = df["item_id"].map(iid_to_emb_idx)
+    df = df[df["emb_idx"].notna()].copy()
+    df["emb_idx"] = df["emb_idx"].astype("int64")
+
+    # Aggregate per user.
+    print(f"  aggregating mean history embeddings ...")
     queries: list[np.ndarray] = []
     targets: list[int] = []
-    for _uid, group in groupby(interactions, key=lambda r: r["user_id"]):
-        events = list(group)
-        if len(events) < 2:
+    for uid, group in df.groupby("user_id", sort=False):
+        target_row = group[group["is_target"]]
+        history_rows = group[~group["is_target"]]
+        if len(target_row) != 1 or len(history_rows) == 0:
             continue
-        history_embs: list[np.ndarray] = []
-        for ev in events[:-1]:
-            iid = ev.get("_resolved_item_id")
-            if iid is not None and iid in catalog_emb_lookup:
-                history_embs.append(catalog_emb_lookup[iid])
-        last_iid = events[-1].get("_resolved_item_id")
-        if not history_embs or last_iid is None or last_iid not in catalog_emb_lookup:
-            continue
-        q = np.mean(np.stack(history_embs), axis=0)
+        target_iid = int(target_row["item_id"].iloc[0])
+        history_embs = catalog_emb_arr[history_rows["emb_idx"].values]
+        q = history_embs.mean(axis=0)
         q = q / (np.linalg.norm(q) + 1e-9)
         queries.append(q.astype(np.float32))
-        targets.append(int(last_iid))
+        targets.append(target_iid)
 
     if not queries:
         return np.zeros((0, 0), dtype=np.float32), []
+    print(f"  {len(queries):,} queries built")
     return np.stack(queries), targets
 
 
@@ -81,9 +143,19 @@ def _build_user_history_queries(
     "--baseline-name", default="B1_plain_clip_mips", type=str,
     help="Tag written into the results JSON (used for B2/B3/B4 reuse).",
 )
+@click.option(
+    "--max-queries", default=20000, type=int,
+    help="Cap on eval queries (random sample of users). v0 default keeps eval tractable.",
+)
+@click.option(
+    "--min-history", default=2, type=int,
+    help="Minimum prior items required per user (target is held out separately).",
+)
+@click.option("--seed", default=42, type=int)
 def main(
     catalog_in: Path, embeddings_in: Path, interactions_in: Path,
     out: Path, ks: str, baseline_name: str,
+    max_queries: int, min_history: int, seed: int,
 ) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -98,17 +170,13 @@ def main(
         catalog.column("parent_asin").to_pylist(),
         catalog.column("item_id").to_pylist(),
     ))
+    iid_to_emb_idx = {int(iid): i for i, iid in enumerate(item_ids)}
 
-    print("Loading interactions ...")
-    inter = pq.read_table(str(interactions_in)).to_pylist()
-    for r in inter:
-        r["_resolved_item_id"] = asin_to_iid.get(r["parent_asin"])
-
-    catalog_emb_lookup = {
-        int(iid): emb_arr[i] for i, iid in enumerate(item_ids)
-    }
-    queries, targets = _build_user_history_queries(inter, catalog_emb_lookup)
-    print(f"  built {len(queries):,} test queries (leave-last-out)")
+    print("Building user-history queries ...")
+    queries, targets = _build_user_history_queries(
+        interactions_in, asin_to_iid, emb_arr, iid_to_emb_idx,
+        max_queries=max_queries, min_history=min_history, seed=seed,
+    )
 
     if len(queries) == 0:
         print("WARNING: no queries built; nothing to evaluate.")
