@@ -49,8 +49,10 @@ class VLClipLightning(L.LightningModule):
     def training_step(self, batch, batch_idx):
         img_emb, txt_emb, logit_scale = self._step_embeds(batch)
         loss = symmetric_infonce(img_emb, txt_emb, logit_scale)
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("train/logit_scale", logit_scale.exp().detach(), on_step=True, on_epoch=False)
+        bs = img_emb.size(0)
+        # Use underscore-only metric names so checkpoint filenames don't tangle with Windows path semantics.
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+        self.log("train_logit_scale", logit_scale.exp().detach(), on_step=True, on_epoch=False, batch_size=bs)
         return loss
 
     def on_validation_epoch_start(self):
@@ -60,7 +62,8 @@ class VLClipLightning(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         img_emb, txt_emb, logit_scale = self._step_embeds(batch)
         loss = symmetric_infonce(img_emb, txt_emb, logit_scale)
-        self.log("val/loss", loss, prog_bar=True, on_epoch=True)
+        bs = img_emb.size(0)
+        self.log("val_loss", loss, prog_bar=True, on_epoch=True, batch_size=bs)
         self._val_image_emb_buf.append(img_emb.detach().float().cpu())
         self._val_text_emb_buf.append(txt_emb.detach().float().cpu())
         return loss
@@ -76,7 +79,7 @@ class VLClipLightning(L.LightningModule):
         targets = torch.arange(n)
         topk = scores.topk(min(10, n), dim=1).indices  # [N, k]
         hits = (topk == targets.unsqueeze(1)).any(dim=1).float()
-        self.log("val/recall@10", hits.mean(), prog_bar=True)
+        self.log("val_recall_at_10", hits.mean(), prog_bar=True)
         self._val_image_emb_buf = []
         self._val_text_emb_buf = []
 

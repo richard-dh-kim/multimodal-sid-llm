@@ -74,11 +74,11 @@ def main(
     model.hparams.total_steps = steps_per_epoch * epochs
 
     callbacks = [
-        EarlyStopping(monitor="val/recall@10", mode="max", patience=patience, verbose=True),
+        EarlyStopping(monitor="val_recall_at_10", mode="max", patience=patience, verbose=True),
         ModelCheckpoint(
             dirpath=str(ckpt_dir),
-            filename="vl_clip-{epoch:02d}-{val/recall@10:.4f}",
-            monitor="val/recall@10", mode="max", save_top_k=1, save_last=True,
+            filename="vl_clip-epoch{epoch:02d}-r10{val_recall_at_10:.4f}",
+            monitor="val_recall_at_10", mode="max", save_top_k=1, save_last=True,
             auto_insert_metric_name=False,
         ),
     ]
@@ -93,6 +93,7 @@ def main(
         logger=logger,
         log_every_n_steps=20,
         val_check_interval=1.0,
+        enable_progress_bar=False,  # rich progress bar can hang on redirected stdout
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
