@@ -59,16 +59,34 @@ class VLClipItemDataset(Dataset):
         }
 
 
-def make_collate_fn(processor):
-    """Returns a collate_fn that uses CLIPProcessor to batch images + texts."""
-    def collate(batch):
+class CLIPCollator:
+    """Top-level callable so DataLoader workers can pickle it on Windows.
+
+    A local closure (the previous `def collate(...)` inside `make_collate_fn`)
+    cannot be pickled by Windows' spawn multiprocessing, which is what
+    Lightning's DataLoader needs for num_workers>0. A class with `__call__`
+    serializes cleanly.
+    """
+
+    def __init__(self, processor):
+        self.processor = processor
+
+    def __call__(self, batch):
         images = [s["image"] for s in batch]
         texts = [s["text"] for s in batch]
         item_ids = [s["item_id"] for s in batch]
-        encoded = processor(
+        encoded = self.processor(
             images=images, text=texts, return_tensors="pt",
             padding=True, truncation=True, max_length=77,
         )
         encoded["item_ids"] = item_ids
         return encoded
-    return collate
+
+
+def make_collate_fn(processor):
+    """Returns a picklable CLIPCollator instance.
+
+    Kept as a factory function for API compatibility; previously returned a
+    local closure that couldn't be pickled to DataLoader worker processes.
+    """
+    return CLIPCollator(processor)
