@@ -49,7 +49,19 @@ class VLClipItemDataset(Dataset):
         row = self.df.iloc[idx]
         iid = int(row["item_id"])
         ipath = image_path_for_item(self.images_dir, iid)
-        image = Image.open(ipath).convert("RGB")
+        try:
+            image = Image.open(ipath)
+            image.load()  # force decode now to surface OSError here, not later
+            image = image.convert("RGB")
+        except (OSError, IOError, Image.UnidentifiedImageError) as e:
+            # Broken JPEGs (partial download, HTML error page saved as .jpg, etc.)
+            # affect <0.1% of items in practice. Substitute a 224x224 gray placeholder
+            # so the batch keeps its size and training continues. Logged once per worker.
+            if not getattr(self, "_warned_broken", False):
+                print(f"[VLClipItemDataset] WARN: broken image at {ipath}: {e}. "
+                      f"Substituting gray placeholder. Further warnings suppressed.")
+                self._warned_broken = True
+            image = Image.new("RGB", (224, 224), (128, 128, 128))
         text = clean_text(row["title"], max_chars=self.text_max_chars)
         return {
             "image": image,
