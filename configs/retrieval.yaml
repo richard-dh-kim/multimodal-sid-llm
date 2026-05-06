@@ -1,0 +1,55 @@
+# M3.7 generative retrieval fine-tune — production recipe.
+#
+# This file is informational: train_retrieval.py reads CLI args, not this YAML.
+# It documents the recipe Richard should match when kicking off the real run.
+# Numbers are taken from the SID-LLM design spec (`docs/.../specs/...`) and the
+# implementation plan (Task 23).
+
+corpus_in: data/catalog/cpt_corpus.parquet
+init_dir: checkpoints/sid_llm/cpt/hf_best          # output of M3.6
+ckpt_dir: checkpoints/sid_llm/retrieval
+
+# Search-mode source. Leave null to fall back to text-only search rows
+# (metadata rows with <seq> rewritten to <search>). When the M2 CLIP/VL-CLIP
+# embeddings pipeline lands, point this at the per-item query embedding parquet.
+embeddings_path: null
+
+# Optimizer / schedule
+optimizer:
+  type: adamw_anchored        # or "adamw" via --no-anchored
+  lr: 1.0e-4
+  weight_decay: 0.005
+  betas: [0.9, 0.98]
+schedule:
+  type: one_cycle
+  pct_start: 0.4
+  div_factor: 8.0
+  final_div_factor: 100.0
+
+# Batching
+batch_size: 8                 # per-device micro-batch
+accumulate_grad_batches: 4    # effective batch = 32 (matches plan line 2576)
+max_input_len: 512
+max_target_len: 16
+
+# Training duration
+epochs: 3
+# total_steps is derived from len(train_loader) / accumulate_grad_batches * epochs.
+
+# Memory / runtime
+gradient_checkpointing: true
+precision: bf16-mixed
+num_workers: 0                # Windows-friendly default
+
+# Reproducibility
+seed: 42
+val_frac: 0.01
+
+# Notes
+# - 50/50 stratified sequence/search sampling is enforced by RetrievalDataset:
+#   even idx -> seq mode, odd idx -> search mode.
+# - Search-mode soft-prompt fusion (CLIP query embedding -> 4 virtual tokens
+#   prepended to the encoder) is wired through the dataset but not yet
+#   consumed in training_step. Adding it is a follow-up task; until then the
+#   <search> token still trains under the text-only fallback.
+# - Wall-time estimate on RTX 4060 Ti: 6-24 hr (per spec §4.7).
