@@ -1,0 +1,17 @@
+{
+  "baseline": "SID_LLM_search",
+  "task": "item-clip-embedding-to-own-sid",
+  "n_queries": 2000,
+  "num_beams": 50,
+  "constrained": true,
+  "metrics": {
+    "recall@5": 0.289,
+    "recall@10": 0.394,
+    "recall@50": 0.6605,
+    "ndcg@5": 0.19959846207683532,
+    "ndcg@10": 0.2335305195822919,
+    "ndcg@50": 0.29285647357292965,
+    "hallucination_rate": 0.0,
+    "silent_miss_rate": 0.0
+  }
+}

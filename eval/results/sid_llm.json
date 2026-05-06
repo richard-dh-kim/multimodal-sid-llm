@@ -1,0 +1,14 @@
+{
+  "baseline": "SID_LLM_init_constrained",
+  "n_queries": 50,
+  "num_beams": 8,
+  "constrained": true,
+  "metrics": {
+    "recall@5": 0.0,
+    "recall@8": 0.0,
+    "ndcg@5": 0.0,
+    "ndcg@8": 0.0,
+    "hallucination_rate": 0.0,
+    "silent_miss_rate": 0.0
+  }
+}

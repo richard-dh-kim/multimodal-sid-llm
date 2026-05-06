@@ -1,0 +1,18 @@
+{
+  "baseline": "SID_LLM_seq",
+  "task": "user-history-to-next-item-sid",
+  "n_queries": 2000,
+  "num_beams": 50,
+  "constrained": true,
+  "max_history_len": 50,
+  "metrics": {
+    "recall@5": 0.0125,
+    "recall@10": 0.015,
+    "recall@50": 0.036,
+    "ndcg@5": 0.00887591010055707,
+    "ndcg@10": 0.009712485732770912,
+    "ndcg@50": 0.014085619927820174,
+    "hallucination_rate": 0.0,
+    "silent_miss_rate": 0.0
+  }
+}

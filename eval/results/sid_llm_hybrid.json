@@ -1,0 +1,16 @@
+{
+  "baseline": "SID_LLM_hybrid",
+  "n_queries": 2000,
+  "num_beams": 50,
+  "constrained": true,
+  "metrics": {
+    "recall@5": 0.0045,
+    "recall@10": 0.006,
+    "recall@50": 0.015,
+    "ndcg@5": 0.0029395678384763926,
+    "ndcg@10": 0.003412718843021338,
+    "ndcg@50": 0.005394434652042149,
+    "hallucination_rate": 0.0,
+    "silent_miss_rate": 0.0
+  }
+}
