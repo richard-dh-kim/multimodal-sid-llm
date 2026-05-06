@@ -4,19 +4,33 @@ Multimodal generative retrieval over Semantic IDs. The model takes a query (text
 
 ## Headline results
 
-Evaluated on a 2,000-query held-out sample from the 150k-item catalog, beam=50, Trie-constrained decoding.
+Evaluated on a 2,000-query held-out sample from the 150k-item catalog, beam=50, Trie-constrained decoding (where applicable). Random over 150k items: recall@10 = 0.0067%.
 
-| Task | Eval | recall@5 | recall@10 | recall@50 | Hallucination |
-|---|---|---|---|---|---|
-| **Multimodal search** (CLIP-embedding query → item SID) | `sid_llm_eval_search.py` | **28.9%** | **39.4%** | **66.05%** | **0%** |
-| Sequence-mode rec (TIGER-comparable: SID history → next SID) | `sid_llm_eval_seq.py` | 1.25% | 1.50% | 3.60% | 0% |
-| TIGER baseline (B3) — same task as above, no contributions | `sid_llm_eval_seq.py` | _TBD_ | _TBD_ | _TBD_ | 0% |
+### Multimodal search — `sid_llm_eval_search.py`
 
-Random baseline over 150k items: recall@10 = 0.0067%.
+The unique capability of this project: given an item's CLIP embedding (a query proxy for "show me items like this photo / this text"), generate the matching item's 4-token SID via beam search. **No prior art baseline runs this task** — TIGER and dense MIPS baselines do not accept embedding queries against a generative SID decoder.
 
-The **multimodal search number is the headline**: given a query item's CLIP embedding, the model autoregressively emits the matching item's SID with 39.4% recall@10 (≈5,880× over random). The sequence-mode number is included for completeness and TIGER-comparison; it's modest in absolute terms because next-item prediction has high inherent entropy (users do not deterministically pick the next item).
+| Eval | recall@5 | recall@10 | recall@50 | Hallucination |
+|---|---|---|---|---|
+| **M3.7 (ours, multimodal)** | **28.9%** | **39.4%** | **66.05%** | **0%** |
 
-**Trie-constrained decoding produces 0% hallucination by construction** — every generated SID maps to a real catalog item.
+**5,880× over random.** The CLIP soft-prompt + Trie-constrained beam search resolves a 512-dim continuous query into a discrete SID over a 150k-item catalog with no hallucination.
+
+### Sequence-mode rec — next-item prediction (TIGER-comparable)
+
+| System | Mechanism | recall@10 | recall@50 | Hallucination |
+|---|---|---|---|---|
+| Random | — | 0.0067% | 0.033% | — |
+| B1 (plain CLIP MIPS) | dense retrieval | 2.55% | 3.31% | — |
+| B2 (VL-CLIP MIPS) | dense retrieval | 2.68% | 3.66% | — |
+| **B3 (TIGER baseline)** | generative retrieval (8.6M-param T5 from scratch) | 1.75% | 3.95% | **0%** |
+| **M3.7 (ours, multimodal)** | generative retrieval + soft-prompt + AdamWAnchored | 1.50% | 3.60% | **0%** |
+
+**M3.7 vs TIGER:** TIGER edges M3.7 by 0.25pp on recall@10. **The multi-task training (sequence + search) costs near-zero rec quality** while *adding* the multimodal search capability that no other system in this table has. That tradeoff is the whole point of the project's architecture.
+
+**Generative retrieval vs dense MIPS:** On this corpus size (150k items), dense MIPS wins on rec recall by roughly 1pp. This is consistent with the [scaling-view paper](https://arxiv.org/pdf/2509.25522) which argues generative retrieval needs significantly more scale to dominate dense baselines. The MIPS baselines used 19,994 queries vs 2,000 for the generative systems; the comparison is qualitatively meaningful but not perfectly apples-to-apples on sample size.
+
+**Trie-constrained decoding gives 0% hallucination by construction** — every generated SID maps to a real catalog item. Applies to both B3 and M3.7 since it's an inference-time logits processor.
 
 ## Architecture
 

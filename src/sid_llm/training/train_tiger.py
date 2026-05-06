@@ -272,7 +272,11 @@ def main(
 
     micro_batches_per_epoch = max(1, len(train_loader))
     opt_steps_per_epoch = max(1, micro_batches_per_epoch // max(1, accumulate_grad_batches))
-    total_steps = max_steps if max_steps > 0 else opt_steps_per_epoch * epochs
+    # +epochs as a buffer: Lightning's optimizer-step counter can run one ahead
+    # of len(train_loader)//accum at each epoch boundary depending on grad-accum
+    # rounding. OneCycleLR raises if step_num exceeds total_steps. The buffer
+    # is small enough not to materially shift the LR curve.
+    total_steps = max_steps if max_steps > 0 else opt_steps_per_epoch * epochs + epochs
     model.hparams.total_steps = total_steps
 
     callbacks = [HFSavePerEpoch(ckpt_dir)]

@@ -1,0 +1,18 @@
+{
+  "baseline": "TIGER_B3",
+  "task": "user-history-to-next-item-sid",
+  "n_queries": 2000,
+  "num_beams": 50,
+  "constrained": true,
+  "max_history_len": 50,
+  "metrics": {
+    "recall@5": 0.014,
+    "recall@10": 0.0175,
+    "recall@50": 0.0395,
+    "ndcg@5": 0.009456189311408882,
+    "ndcg@10": 0.01059252709656099,
+    "ndcg@50": 0.015476412004324293,
+    "hallucination_rate": 0.0,
+    "silent_miss_rate": 0.0
+  }
+}
