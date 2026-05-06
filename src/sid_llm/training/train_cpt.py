@@ -15,17 +15,25 @@ from transformers import T5ForConditionalGeneration, T5TokenizerFast
 
 
 class CPTSeqDataset(Dataset):
-    """Reads cpt_corpus.parquet and yields (input_text, target_text) per row."""
+    """Reads cpt_corpus.parquet and yields (input_text, target_text) per row.
+
+    Holds the PyArrow columns directly instead of materializing 300k Python
+    dicts — keeps baseline CPU RAM low so the per-epoch HF save has headroom.
+    """
 
     def __init__(self, corpus_path: Path):
-        t = pq.read_table(str(corpus_path))
-        self.rows = t.to_pylist()
+        self.table = pq.read_table(str(corpus_path))
+        self._input_col = self.table.column("input_text")
+        self._target_col = self.table.column("target_text")
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return self.table.num_rows
 
     def __getitem__(self, idx: int) -> dict:
-        return self.rows[idx]
+        return {
+            "input_text": self._input_col[idx].as_py(),
+            "target_text": self._target_col[idx].as_py(),
+        }
 
 
 class _NullContext:
@@ -86,11 +94,16 @@ class CPTLightning(L.LightningModule):
         weight_decay: float = 0.01,
         warmup_steps: int = 500,
         total_steps: int | None = None,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.tokenizer = T5TokenizerFast.from_pretrained(str(init_dir))
         self.model = T5ForConditionalGeneration.from_pretrained(str(init_dir))
+        if gradient_checkpointing:
+            # T5 requires use_cache=False to be compatible with grad checkpointing.
+            self.model.config.use_cache = False
+            self.model.gradient_checkpointing_enable()
 
     def forward(self, **batch):
         return self.model(**batch)
@@ -141,9 +154,14 @@ class HFSavePerEpoch(Callback):
         self._best_loss: float = float("inf")
 
     def on_train_epoch_end(self, trainer, pl_module):
+        # max_shard_size limits the peak bytes() allocation per shard.
+        # Without it, safetensors._tobytes() copies the full 894MB state in one
+        # allocation and on a 16GB-RAM Windows box (with optimizer state + dataset
+        # already resident) that can OOM.
+        save_kwargs = {"max_shard_size": "200MB"}
         latest = self.ckpt_dir / "hf_latest"
         latest.mkdir(parents=True, exist_ok=True)
-        pl_module.model.save_pretrained(str(latest))
+        pl_module.model.save_pretrained(str(latest), **save_kwargs)
         pl_module.tokenizer.save_pretrained(str(latest))
         cur = trainer.callback_metrics.get("val_loss")
         if cur is None:
@@ -153,7 +171,7 @@ class HFSavePerEpoch(Callback):
             self._best_loss = cur_v
             best = self.ckpt_dir / "hf_best"
             best.mkdir(parents=True, exist_ok=True)
-            pl_module.model.save_pretrained(str(best))
+            pl_module.model.save_pretrained(str(best), **save_kwargs)
             pl_module.tokenizer.save_pretrained(str(best))
 
 
@@ -172,11 +190,18 @@ class HFSavePerEpoch(Callback):
 )
 @click.option("--epochs", default=2, type=int)
 @click.option("--max-steps", default=-1, type=int, help="If >0, stop after this many train steps.")
-@click.option("--batch-size", default=32, type=int)
+@click.option("--batch-size", default=8, type=int,
+              help="Per-device micro-batch. Effective batch = batch_size * accumulate_grad_batches.")
+@click.option("--accumulate-grad-batches", default=4, type=int,
+              help="Number of micro-batches per optimizer step.")
+@click.option("--gradient-checkpointing/--no-gradient-checkpointing", default=True,
+              help="Trade compute for activation memory; recommended on 16GB GPUs.")
 @click.option("--lr", default=3e-4, type=float)
 @click.option("--weight-decay", default=0.01, type=float)
 @click.option("--warmup-steps", default=500, type=int)
-@click.option("--num-workers", default=0, type=int)
+@click.option("--num-workers", default=0, type=int,
+              help="Keep 0 on Windows: DataLoader workers there are spawned (no CoW), "
+                   "so each one re-loads the corpus and inflates CPU RAM.")
 @click.option("--smoke-cap", default=0, type=int, help="If >0, cap corpus to N rows (smoke).")
 @click.option("--val-frac", default=0.01, type=float)
 @click.option("--max-input-len", default=512, type=int)
@@ -184,6 +209,7 @@ class HFSavePerEpoch(Callback):
 @click.option("--precision", default="bf16-mixed", type=str)
 def main(
     corpus_in, init_dir, ckpt_dir, epochs, max_steps, batch_size,
+    accumulate_grad_batches, gradient_checkpointing,
     lr, weight_decay, warmup_steps, num_workers, smoke_cap, val_frac,
     max_input_len, max_target_len, precision,
 ):
@@ -210,7 +236,8 @@ def main(
 
     print(f"Instantiating SID-LLM (CPT) from {init_dir} ...")
     model = CPTLightning(init_dir=init_dir, lr=lr, weight_decay=weight_decay,
-                          warmup_steps=warmup_steps)
+                          warmup_steps=warmup_steps,
+                          gradient_checkpointing=gradient_checkpointing)
     collate = T5Collator(model.tokenizer, max_input_len=max_input_len, max_target_len=max_target_len)
 
     train_loader = DataLoader(
@@ -222,8 +249,11 @@ def main(
         collate_fn=collate, pin_memory=True, persistent_workers=(num_workers > 0),
     )
 
-    steps_per_epoch = max(1, len(train_loader))
-    total_steps = max_steps if max_steps > 0 else steps_per_epoch * epochs
+    # Optimizer steps (= scheduler steps), not micro-batches. With grad accum,
+    # one optimizer step consumes accumulate_grad_batches dataloader iterations.
+    micro_batches_per_epoch = max(1, len(train_loader))
+    opt_steps_per_epoch = max(1, micro_batches_per_epoch // max(1, accumulate_grad_batches))
+    total_steps = max_steps if max_steps > 0 else opt_steps_per_epoch * epochs
     model.hparams.total_steps = total_steps
 
     callbacks = [HFSavePerEpoch(ckpt_dir)]
@@ -235,6 +265,7 @@ def main(
         accelerator="auto",
         devices=1,
         precision=precision,
+        accumulate_grad_batches=accumulate_grad_batches,
         callbacks=callbacks,
         logger=logger,
         log_every_n_steps=20,
