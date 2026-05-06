@@ -1,30 +1,7 @@
-"""Sequence-mode eval for an M3.7 retrieval-fine-tuned SID-LLM checkpoint.
+"""Sequence-mode eval (history-of-SIDs -> next-SID) for a SID-LLM checkpoint.
 
-Eval task (matches the TIGER paper's sequential rec eval format and what M3.7
-trains on in sequence mode):
-    For each user with at least min_history+1 interactions, sort chronologically:
-        history = items[:-1]   (clipped to last --max-history-len)
-        target  = items[-1].item_id
-        query   = "<seq> " + concat of "<sid_a><sid_b><sid_c><sid_d>" per history item
-    Metric: recall@k, ndcg@k of the model's beam-search output.
-
-Distinct from `sid_llm_eval.py` (text-mode, last-title heuristic) and
-`sid_llm_eval_search.py` (search-mode, item embedding -> own SID). This file is
-the headline next-item recsys number on the README.
-
-The query format mirrors `build_cpt_corpus.build_behavior_sequence` exactly so
-the eval matches the M3.7 sequence-mode training distribution.
-
-Usage (after CPT + M3.7 finish):
-    python -m sid_llm.eval.sid_llm_eval_seq \\
-        --ckpt-dir checkpoints/sid_llm/retrieval/hf_best \\
-        --catalog-in data/catalog/catalog_with_sid.parquet \\
-        --interactions-in data/catalog/interactions.parquet \\
-        --sid-to-item data/catalog/sid_to_item.pkl \\
-        --sid-trie data/catalog/sid_trie.pkl \\
-        --max-queries 2000 --num-beams 50 --ks 5,10,50 \\
-        --baseline-name SID_LLM_seq \\
-        --out eval/results/sid_llm_seq.json
+Query format mirrors `build_cpt_corpus.build_behavior_sequence` so the
+distribution matches sequence-mode training.
 """
 from __future__ import annotations
 
@@ -44,11 +21,7 @@ from sid_llm.inference.beam_search import load_retriever
 
 
 def _history_to_query_text(history_sids: list[tuple[int, int, int, int]]) -> str:
-    """Mirror of build_cpt_corpus.build_behavior_sequence's input format.
-
-    Produces "<seq> <sid_a0><sid_a1><sid_a2><sid_a3>...<sid_y0><sid_y1><sid_y2><sid_y3>"
-    with no spaces between SIDs within a tuple and no spaces between tuples.
-    """
+    """Mirror of build_cpt_corpus.build_behavior_sequence's input format."""
     history_tokens = "".join(
         "".join(f"<sid_{c}>" for c in tup) for tup in history_sids
     )
@@ -66,15 +39,12 @@ def _build_seq_queries(
 ) -> tuple[list[str], list[int]]:
     """Build (query_text, target_item_id) pairs for sequence-mode eval.
 
-    Eligible users have >= min_history + 1 catalog-resolved interactions. For each:
-      - sort chronologically
-      - hold out last item as the target
-      - clip the remaining history to last `max_history_len` items
-      - format query as `<seq> <sid_..><sid_..>...` matching the CPT corpus
+    Eligible users have >= min_history + 1 catalog-resolved interactions; the
+    last item is the target, the preceding items (clipped to max_history_len)
+    form the history.
     """
     df = interactions_df[interactions_df["parent_asin"].isin(asin_to_iid.keys())].copy()
     df["item_id"] = df["parent_asin"].map(asin_to_iid).astype("int64")
-    # Drop items missing SIDs (shouldn't happen if catalog is consistent, but be safe).
     df = df[df["item_id"].isin(iid_to_sid.keys())].copy()
     df = df.sort_values(["user_id", "timestamp_ms"], kind="mergesort")
 
@@ -199,8 +169,7 @@ def main(
         item_ids, sids = retr.retrieve_from_text(
             q, k=max_k, num_beams=num_beams, constrained=constrained
         )
-        # Push -1 (silent miss) to the back so they don't poison recall@k for hits
-        # that came in below them; matches the text-eval convention.
+        # Push silent-miss (-1) to the back so it doesn't displace hits in recall@k.
         preds.append(
             [iid for iid in item_ids if iid >= 0]
             + [iid for iid in item_ids if iid < 0]

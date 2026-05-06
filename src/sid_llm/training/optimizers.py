@@ -1,21 +1,4 @@
-"""AdamW variants for SID-LLM training.
-
-`AdamWAnchored` implements L2-SP regularization: the weight-decay term pulls
-parameters toward a captured `theta_init` rather than toward zero. This keeps
-the fine-tune from forgetting CPT-learned representations.
-
-Update rule (per parameter, ignoring bias correction details, identical to
-torch.optim.AdamW except for the decay target):
-
-    m_t   = beta1 * m_{t-1} + (1 - beta1) * g_t
-    v_t   = beta2 * v_{t-1} + (1 - beta2) * g_t^2
-    m_hat = m_t / (1 - beta1^t)
-    v_hat = v_t / (1 - beta2^t)
-    theta -= lr * (m_hat / (sqrt(v_hat) + eps) + wd * (theta - theta_init))
-
-`theta_init` is captured (cloned, detached, on the same device/dtype) at
-optimizer construction time and never updated.
-"""
+"""AdamW with L2-SP: weight decay pulls toward captured init weights, not zero."""
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -27,8 +10,9 @@ from torch.optim.optimizer import Optimizer
 class AdamWAnchored(Optimizer):
     """AdamW that decays toward init weights (L2-SP) instead of toward zero.
 
-    Same constructor surface as torch.optim.AdamW. Captures a frozen clone of
-    every parameter at __init__ time as the anchor for that parameter.
+    Anchor `theta_init` is a detached clone captured per-parameter at __init__,
+    living on the parameter's own device. Update rule:
+        theta -= lr * m_hat / (sqrt(v_hat) + eps) + lr * wd * (theta - theta_init)
     """
 
     def __init__(
@@ -53,9 +37,6 @@ class AdamWAnchored(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
-        # Snapshot the anchor (theta_init) for every parameter under management.
-        # Stored on the parameter's own device so the decay term never crosses
-        # devices on the hot path.
         for group in self.param_groups:
             for p in group["params"]:
                 self.state[p]["theta_init"] = p.detach().clone()
@@ -86,8 +67,7 @@ class AdamWAnchored(Optimizer):
                     state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     if "theta_init" not in state:
-                        # If a parameter was added to the optimizer after __init__
-                        # (rare; e.g. add_param_group), anchor it on first sight.
+                        # add_param_group path: anchor on first sight.
                         state["theta_init"] = p.detach().clone()
 
                 exp_avg = state["exp_avg"]
@@ -106,10 +86,8 @@ class AdamWAnchored(Optimizer):
                 denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(eps)
                 step_size = lr / bias_correction1
 
-                # Adam step.
                 p.addcdiv_(exp_avg, denom, value=-step_size)
 
-                # L2-SP anchor decay: theta -= lr * wd * (theta - theta_init)
                 if wd != 0.0:
                     p.add_(p - theta_init, alpha=-lr * wd)
 

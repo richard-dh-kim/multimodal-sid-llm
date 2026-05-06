@@ -1,29 +1,4 @@
-"""Search-mode eval for an M3.7 retrieval-fine-tuned SID-LLM checkpoint.
-
-Eval task (matches how the model is trained in search mode):
-    For each item:  query = item's CLIP embedding
-                    target = item's SID -> item_id
-    Metric:         recall@k, ndcg@k for the model's beam-search output.
-
-This is the natural sanity check: search-mode training is "embedding of item X
--> SID of item X", so the same task at eval time tells us whether the soft-
-prompt projection actually learned to route a query embedding to its own SID.
-Cross-item / next-item evals can come later.
-
-Distinct from `sid_llm_eval.py` (text-mode eval) — separate file so the schema
-of the existing CLI / output JSON is untouched.
-
-Usage (after M3.7 finishes training):
-    python -m sid_llm.eval.sid_llm_eval_search \\
-        --ckpt-dir checkpoints/sid_llm/retrieval/hf_best \\
-        --embeddings-in data/catalog/embeddings_b2.parquet \\
-        --catalog-in data/catalog/catalog_with_sid.parquet \\
-        --sid-to-item data/catalog/sid_to_item.pkl \\
-        --sid-trie data/catalog/sid_trie.pkl \\
-        --max-queries 2000 --num-beams 10 --ks 10,50,100 \\
-        --baseline-name SID_LLM_search \\
-        --out eval/results/sid_llm_search.json
-"""
+"""Search-mode eval (item CLIP embedding -> own SID) for a SID-LLM checkpoint."""
 from __future__ import annotations
 
 import json
@@ -63,7 +38,7 @@ def _load_embeddings(
     embeddings_path: Path,
     iid_to_sid: dict[int, tuple[int, int, int, int]],
 ) -> tuple[np.ndarray, list[int]]:
-    """Returns (embeddings: [N, 512], item_ids: [N]) for items that also have a SID."""
+    """(embeddings[N, D], item_ids[N]) for items present in both `embeddings_path` and `iid_to_sid`."""
     tbl = pq.read_table(str(embeddings_path), columns=["item_id", "embedding"])
     iids_full = tbl.column("item_id").to_pylist()
     embs_full = tbl.column("embedding").to_pylist()
@@ -144,6 +119,12 @@ def main(
 
     k_list = [int(x) for x in ks.split(",")]
     max_k = max(k_list)
+    if num_beams < max_k:
+        print(
+            f"WARNING: num_beams ({num_beams}) < max(ks) ({max_k}); "
+            f"auto-bumping num_beams to {max_k}."
+        )
+        num_beams = max_k
 
     print(
         f"Running search-mode beam search over {n_q:,} queries "
@@ -156,8 +137,7 @@ def main(
         item_ids, sids = retr.retrieve_from_query_embedding(
             q, k=max_k, num_beams=num_beams, constrained=constrained
         )
-        # Push -1 (silent miss) to the back so they don't poison recall@k for hits
-        # that came in below them; matches the text-eval convention.
+        # Push silent-miss (-1) to the back so it doesn't displace hits in recall@k.
         preds.append(
             [iid for iid in item_ids if iid >= 0]
             + [iid for iid in item_ids if iid < 0]

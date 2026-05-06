@@ -1,7 +1,6 @@
 """Diagnostic: trace one CPT training example end-to-end through the loaded checkpoint."""
 from __future__ import annotations
 
-import pickle
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -26,7 +25,6 @@ def main():
     print("pad_token_id:          ", model.config.pad_token_id)
     print("eos_token_id:          ", model.config.eos_token_id)
 
-    # SID token ID resolution
     sid_token_ids = tok.convert_tokens_to_ids([f"<sid_{i}>" for i in range(1024)])
     sid_eos_id = tok.convert_tokens_to_ids("<sid_eos>")
     print(f"<sid_0>   -> {sid_token_ids[0]}")
@@ -38,7 +36,6 @@ def main():
 
     print("\nLoading corpus")
     table = pq.read_table(str(CORPUS))
-    # Pick a metadata row
     md_idx = None
     for i in range(table.num_rows):
         st = table.column("seq_type")[i].as_py()
@@ -50,7 +47,6 @@ def main():
     print("input_text :", row["input_text"][:200])
     print("target_text:", row["target_text"])
 
-    # Tokenize input + target
     inp = tok(row["input_text"], return_tensors="pt", truncation=True, max_length=512).to("cuda")
     tgt = tok(row["target_text"], return_tensors="pt", padding=False, truncation=True, max_length=16).to("cuda")
     labels = tgt["input_ids"].clone()

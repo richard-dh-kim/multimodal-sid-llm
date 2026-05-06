@@ -1,14 +1,4 @@
-"""Unit + smoke tests for the TIGER replication baseline (B3).
-
-Three tests:
-  1. `test_build_tiger_baseline_dim` — model has the published TIGER dims and
-     a vocab matching the M3.5 expanded tokenizer; total parameter count is
-     small (under 30M, dominated by the 33k-vocab embedding table).
-  2. `test_train_tiger_dataset_filters_to_behavior_rows` — the dataset class
-     drops metadata rows.
-  3. `test_train_tiger_smoke_step` — one CPU train step on synthetic data:
-     loss is finite, encoder gradient is non-zero.
-"""
+"""Unit + smoke tests for the TIGER replication baseline."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -43,8 +33,6 @@ def test_build_tiger_baseline_dim():
     assert cfg.num_layers == TIGER_NUM_LAYERS == 6
     assert cfg.num_decoder_layers == TIGER_NUM_DECODER_LAYERS == 6
     assert cfg.num_heads == TIGER_NUM_HEADS == 4
-    # Vocab parity with the shared M3.5 tokenizer is what makes the eval
-    # harness drop in across baselines.
     assert cfg.vocab_size == len(tokenizer)
     n_params = sum(p.numel() for p in model.parameters())
     assert n_params < 30_000_000, f"TIGER baseline grew to {n_params:,} params"
@@ -71,9 +59,7 @@ def test_train_tiger_dataset_filters_to_behavior_rows(tmp_path: Path):
 
 @pytest.mark.skipif(not _INIT_DIR.exists(), reason="M3.5 init dir not present")
 def test_train_tiger_smoke_step(tmp_path: Path):
-    """One forward+backward on CPU. Asserts loss is finite and grads reach the
-    encoder body (i.e. autograd is wired through the TIGER model)."""
-    # Tiny synthetic behavior corpus.
+    """One CPU forward+backward; loss finite, grad reaches the encoder body."""
     rows = [
         {"seq_type": "behavior",
          "input_text": "<seq> <sid_a_1><sid_b_2><sid_c_3><sid_d_4>",
@@ -99,9 +85,8 @@ def test_train_tiger_smoke_step(tmp_path: Path):
     out = pl_module.model(**batch)
     assert torch.isfinite(out.loss), f"loss not finite: {out.loss.item()}"
     out.loss.backward()
-    # The first encoder block's input layer norm is a small-but-nonzero leaf
-    # near the input — its grad being nonzero proves the chain reached the
-    # body of the TIGER stack (not just the embedding table).
+    # First encoder block param's grad being nonzero proves autograd reached
+    # past the embedding table into the body of the TIGER stack.
     enc_block_param = next(
         p for n, p in pl_module.model.named_parameters()
         if n.startswith("encoder.block.0.layer.0") and p.requires_grad

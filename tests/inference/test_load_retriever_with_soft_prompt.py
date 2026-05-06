@@ -1,15 +1,4 @@
-"""CPU-only test: `load_retriever` discovers and loads `soft_prompt.pt`.
-
-We simulate an M3.7 checkpoint directory by saving a tiny T5 + tokenizer plus
-a hand-crafted `soft_prompt.pt` (matching the on-disk layout written by
-`train_retrieval.HFSavePerEpoch`). Then we call `load_retriever` and verify
-that:
-  1. The returned retriever has `query_projection` and `soft_prompt_offsets`.
-  2. The loaded weights match what we wrote to disk.
-  3. The retriever can actually call `retrieve_from_query_embedding` end-to-end.
-  4. A checkpoint without `soft_prompt.pt` returns a sequence-mode-only
-     retriever (no crash on load, but search mode raises).
-"""
+"""CPU tests: `load_retriever` discovers and loads `soft_prompt.pt` and falls back when absent."""
 from __future__ import annotations
 
 import pickle
@@ -55,7 +44,6 @@ def _make_tiny_t5_dir(out_dir: Path) -> None:
 
 
 def _write_artifacts(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """Write sid_to_item.pkl + sid_trie.pkl with a tiny 3-SID catalog."""
     sids = [
         (0, 1, 2, 3),
         (0, 1, 4, 5),
@@ -73,7 +61,6 @@ def _write_artifacts(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 
 def _write_soft_prompt(path: Path) -> dict:
-    """Write a soft_prompt.pt with deterministic weights and return the saved dict."""
     torch.manual_seed(11)
     weight = torch.randn(D_MODEL, QUERY_DIM)
     bias = torch.randn(D_MODEL)
@@ -100,11 +87,9 @@ def test_load_retriever_with_soft_prompt(tmp_path):
         device="cpu",
     )
 
-    # Soft-prompt fields populated.
     assert retr.query_projection is not None, "query_projection not loaded"
     assert retr.soft_prompt_offsets is not None, "soft_prompt_offsets not loaded"
 
-    # Weights match what we wrote (allowing for device placement only).
     assert torch.allclose(
         retr.query_projection.weight.detach().cpu(),
         saved["query_projection.state_dict"]["weight"],
@@ -121,7 +106,6 @@ def test_load_retriever_with_soft_prompt(tmp_path):
         atol=1e-6,
     )
 
-    # End-to-end search mode call works.
     q = torch.randn(QUERY_DIM)
     item_ids, sids = retr.retrieve_from_query_embedding(
         q, k=2, num_beams=4, constrained=True
@@ -135,7 +119,6 @@ def test_load_retriever_without_soft_prompt_is_sequence_only(tmp_path):
     ckpt_dir.mkdir()
     _make_tiny_t5_dir(ckpt_dir)
     sid_to_item_path, sid_trie_path, _ = _write_artifacts(tmp_path)
-    # Note: deliberately NOT writing soft_prompt.pt.
 
     retr = load_retriever(
         ckpt_dir=ckpt_dir,
@@ -152,8 +135,7 @@ def test_load_retriever_without_soft_prompt_is_sequence_only(tmp_path):
 
 
 def test_explicit_soft_prompt_path_overrides_default(tmp_path):
-    """If user passes `soft_prompt_path=` explicitly, that wins over the
-    default `<ckpt_dir>/soft_prompt.pt` location."""
+    """Explicit soft_prompt_path wins over the default <ckpt_dir>/soft_prompt.pt."""
     ckpt_dir = tmp_path / "hf_latest"
     ckpt_dir.mkdir()
     _make_tiny_t5_dir(ckpt_dir)

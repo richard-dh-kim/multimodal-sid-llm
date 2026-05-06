@@ -1,9 +1,4 @@
-"""Tests for RetrievalDataset / RetrievalBatchSampler / RetrievalCollator.
-
-The dataset's search-mode rows REQUIRE both an embeddings parquet and a
-catalog_with_sid parquet. There is no text fallback (M3.7 design — soft-prompt
-fusion is the only correct search-mode path).
-"""
+"""Tests for RetrievalDataset / RetrievalBatchSampler / RetrievalCollator."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -19,11 +14,6 @@ from sid_llm.training.datasets import (
     RetrievalCollator,
     RetrievalDataset,
 )
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 
 def _write_corpus(tmp_path: Path, n_behavior: int = 6, n_metadata: int = 6) -> Path:
@@ -46,12 +36,10 @@ def _write_corpus(tmp_path: Path, n_behavior: int = 6, n_metadata: int = 6) -> P
 
 
 def _write_embeddings(tmp_path: Path, n_items: int = 10, dim: int = 512, seed: int = 0) -> Path:
-    """Write a tiny synthetic embeddings parquet with item_ids 0..n_items-1."""
     rng = np.random.default_rng(seed)
     rows = []
     for iid in range(n_items):
         vec = rng.standard_normal(dim).astype(np.float32)
-        # L2-normalize, mirroring how production embeddings are stored.
         vec /= np.linalg.norm(vec) + 1e-8
         rows.append({"item_id": int(iid), "embedding": vec.tolist()})
     p = tmp_path / "embeddings.parquet"
@@ -60,7 +48,6 @@ def _write_embeddings(tmp_path: Path, n_items: int = 10, dim: int = 512, seed: i
 
 
 def _write_catalog_with_sid(tmp_path: Path, n_items: int = 10, seed: int = 0) -> Path:
-    """Write a tiny synthetic catalog_with_sid parquet with item_ids 0..n_items-1."""
     rng = np.random.default_rng(seed)
     rows = []
     for iid in range(n_items):
@@ -74,11 +61,6 @@ def _write_catalog_with_sid(tmp_path: Path, n_items: int = 10, seed: int = 0) ->
     p = tmp_path / "catalog_with_sid.parquet"
     pq.write_table(pa.Table.from_pylist(rows), str(p))
     return p
-
-
-# ---------------------------------------------------------------------------
-# RetrievalDataset
-# ---------------------------------------------------------------------------
 
 
 def test_dataset_5050_split_with_embeddings(tmp_path: Path):
@@ -151,29 +133,21 @@ def test_dataset_skips_items_missing_sid(tmp_path: Path):
     """Embeddings whose item_id has no SID entry are silently dropped."""
     corpus = _write_corpus(tmp_path, n_behavior=10, n_metadata=10)
     emb = _write_embeddings(tmp_path, n_items=10)
-    # Only items 0..4 have SIDs; items 5..9 in the embedding parquet are unmatched.
     sids = _write_catalog_with_sid(tmp_path, n_items=5)
     ds = RetrievalDataset(
         corpus_path=corpus, embeddings_path=emb, catalog_with_sid_path=sids
     )
-    # Only 5 search-mode rows survive the join; n_each = min(10, 5) = 5.
+    # n_each = min(10 behavior, 5 joined search) = 5.
     assert len(ds) == 10
-
-
-# ---------------------------------------------------------------------------
-# RetrievalBatchSampler
-# ---------------------------------------------------------------------------
 
 
 def test_batch_sampler_emits_uniform_mode_batches():
     sampler = RetrievalBatchSampler(n_each=8, batch_size=4, shuffle=False, drop_last=True)
     batches = list(iter(sampler))
     assert len(batches) == len(sampler)
-    # 8 items per side, batch_size 4 -> 2 seq batches and 2 search batches, alternating.
     assert len(batches) == 4
     for b_idx, batch in enumerate(batches):
         if b_idx % 2 == 0:
-            # sequence batch: all even dataset indices.
             assert all(i % 2 == 0 for i in batch), f"batch {b_idx} expected all-seq, got {batch}"
         else:
             assert all(i % 2 == 1 for i in batch), f"batch {b_idx} expected all-search, got {batch}"
@@ -188,14 +162,8 @@ def test_batch_sampler_drop_last_truncates():
         assert len(batch) == 4
 
 
-# ---------------------------------------------------------------------------
-# RetrievalCollator
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture(scope="module")
 def tokenizer():
-    """Tiny tokenizer with the SID/mode tokens we use in tests."""
     from transformers import T5TokenizerFast
 
     tok = T5TokenizerFast.from_pretrained("t5-small")
@@ -237,7 +205,7 @@ def test_collator_search_batch(tokenizer):
     out = coll(batch)
     assert out["mode"] == "search"
     assert out["query_embeddings"].shape == (2, 512)
-    assert "input_ids" not in out  # search-mode does NOT use input_ids
+    assert "input_ids" not in out
     assert out["labels"].shape[0] == 2
 
 

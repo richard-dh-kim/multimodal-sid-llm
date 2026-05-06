@@ -1,11 +1,4 @@
-"""Ad-hoc CPT-aligned sanity eval.
-
-Samples rows directly from cpt_corpus.parquet (the exact distribution the model was
-trained on), runs Trie-constrained beam search, and reports recall@1/recall@8 for
-the metadata (title->SID) and behavior (history->next-SID) tasks separately.
-
-This bypasses the M3.8 user-history-text eval, which is OOD vs. CPT's training format.
-"""
+"""CPT-aligned sanity eval: samples from cpt_corpus.parquet and reports per-seq_type recall@1/k."""
 from __future__ import annotations
 
 import random
@@ -59,7 +52,6 @@ def main(ckpt_dir, corpus_in, sid_to_item, sid_trie, n, num_beams, seed):
 
     summary: dict[str, dict[str, float]] = {}
     for st in seq_types:
-        # Filter to this seq_type, sample n indices.
         mask = [t == st for t in table.column("seq_type").to_pylist()]
         idxs = [i for i, m in enumerate(mask) if m]
         if not idxs:

@@ -24,9 +24,7 @@ def _build_user_history_queries_text(
     min_history: int,
     seed: int,
 ) -> tuple[list[str], list[int]]:
-    """Same structure as B1's user-history queries, but the QUERY is the title of
-    the most-recent prior item (a heuristic search-mode text query). Target = last item id.
-    """
+    """Title-of-last-history-item -> next-item id. Heuristic text-mode eval."""
     df = pq.read_table(
         str(interactions_path),
         columns=["user_id", "parent_asin", "timestamp_ms"],
@@ -130,15 +128,21 @@ def main(
 
     k_list = [int(x) for x in ks.split(",")]
     max_k = max(k_list)
+    if num_beams < max_k:
+        print(
+            f"WARNING: num_beams ({num_beams}) < max(ks) ({max_k}); "
+            f"auto-bumping num_beams to {max_k}."
+        )
+        num_beams = max_k
 
     print(f"Running beam search over {len(queries):,} queries (num_beams={num_beams}, constrained={constrained}) ...")
     preds: list[list[int]] = []
     all_sids: list[tuple[int, int, int, int]] = []
     for q in tqdm(queries, desc="retrieve"):
         item_ids, sids = retr.retrieve_from_text(q, k=max_k, num_beams=num_beams, constrained=constrained)
-        # Filter -1 (silent miss) from preds for recall computation, but still log them
+        # Push silent-miss (-1) to the back so it doesn't displace hits in recall@k.
         preds.append([iid for iid in item_ids if iid >= 0] + [iid for iid in item_ids if iid < 0])
-        all_sids.extend(sids[:1])  # just the top-1 SID per query, for hallucination/silent-miss
+        all_sids.extend(sids[:1])
 
     valid_sids = set(retr.sid_to_item.keys())
     halluc = hallucination_rate(all_sids, valid_sids)

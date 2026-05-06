@@ -1,8 +1,4 @@
-"""PyTorch Datasets for SID-LLM training.
-
-- `VLClipItemDataset` / `CLIPCollator`: VL-CLIP fine-tuning (M2).
-- `RetrievalDataset` / `RetrievalCollator`: generative retrieval fine-tune (M3.7).
-"""
+"""Datasets and collators for VL-CLIP and generative-retrieval fine-tuning."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -18,13 +14,7 @@ from sid_llm.data.text_clean import clean_text
 
 
 class VLClipItemDataset(Dataset):
-    """Reads catalog.parquet, filters to (split, has_image) rows whose JPGs
-    are actually on disk under images_dir. __getitem__ returns a dict with
-    'image' (PIL.Image), 'text' (cleaned title), 'item_id', 'sub_category'.
-
-    Tokenization + image preprocessing happens in the collate_fn (so the dataset
-    stays cheap and the heavy lifting is batched).
-    """
+    """Catalog rows for VL-CLIP fine-tune. Filters to (split, has_image=True, JPG on disk)."""
 
     def __init__(
         self,
@@ -40,7 +30,6 @@ class VLClipItemDataset(Dataset):
         t = pq.read_table(str(catalog_path), columns=cols)
         df = t.to_pandas()
 
-        # Filter to (split, has_image=True, image actually on disk).
         df = df[(df["split"] == split) & (df["has_image"])].copy()
         df = df[df["item_id"].apply(
             lambda iid: image_path_for_item(self.images_dir, int(iid)).exists()
@@ -57,12 +46,11 @@ class VLClipItemDataset(Dataset):
         ipath = image_path_for_item(self.images_dir, iid)
         try:
             image = Image.open(ipath)
-            image.load()  # force decode now to surface OSError here, not later
+            image.load()
             image = image.convert("RGB")
         except (OSError, IOError, Image.UnidentifiedImageError) as e:
-            # Broken JPEGs (partial download, HTML error page saved as .jpg, etc.)
-            # affect <0.1% of items in practice. Substitute a 224x224 gray placeholder
-            # so the batch keeps its size and training continues. Logged once per worker.
+            # Broken JPEG (partial download, HTML error saved as .jpg). Substitute a
+            # gray placeholder so the batch keeps its size; warn once per worker.
             if not getattr(self, "_warned_broken", False):
                 print(f"[VLClipItemDataset] WARN: broken image at {ipath}: {e}. "
                       f"Substituting gray placeholder. Further warnings suppressed.")
@@ -78,13 +66,7 @@ class VLClipItemDataset(Dataset):
 
 
 class CLIPCollator:
-    """Top-level callable so DataLoader workers can pickle it on Windows.
-
-    A local closure (the previous `def collate(...)` inside `make_collate_fn`)
-    cannot be pickled by Windows' spawn multiprocessing, which is what
-    Lightning's DataLoader needs for num_workers>0. A class with `__call__`
-    serializes cleanly.
-    """
+    """Top-level callable so multi-worker DataLoader can pickle it on Windows."""
 
     def __init__(self, processor):
         self.processor = processor
@@ -102,45 +84,25 @@ class CLIPCollator:
 
 
 def make_collate_fn(processor):
-    """Returns a picklable CLIPCollator instance.
-
-    Kept as a factory function for API compatibility; previously returned a
-    local closure that couldn't be pickled to DataLoader worker processes.
-    """
     return CLIPCollator(processor)
 
 
-# ---------------------------------------------------------------------------
-# M3.7 generative retrieval fine-tune
-# ---------------------------------------------------------------------------
-
-
 def _format_sid_target(sid_0: int, sid_1: int, sid_2: int, sid_3: int) -> str:
-    """Render an item's 4 codebook codes as the canonical SID target string,
-    matching the metadata-row format produced by build_cpt_corpus."""
+    """Render 4 codebook codes as the SID target string (matches build_cpt_corpus)."""
     return f"<sid_{int(sid_0)}><sid_{int(sid_1)}><sid_{int(sid_2)}><sid_{int(sid_3)}><sid_eos>"
 
 
 class RetrievalDataset(Dataset):
     """Stratified 50/50 sequence-mode + search-mode retrieval examples.
 
-    Sequence-mode rows come from `cpt_corpus.parquet` (rows where
-    `seq_type == "behavior"`). These are formatted as
-        `<seq> <sid_a><sid_b>...` -> `<sid_x><sid_y><sid_z><sid_w><sid_eos>`
-    and feed the standard T5 encoder via `input_ids`.
+    Sequence-mode: behavior rows from cpt_corpus.parquet (history-of-SIDs ->
+    next-SID), fed to T5 via input_ids.
+    Search-mode: CLIP item embedding -> own-SID. The LightningModule builds
+    a 5-token encoder input from the embedding (4 soft tokens + <search>).
 
-    Search-mode rows come from `embeddings_path` (CLIP item embeddings keyed
-    by item_id) joined with `catalog_with_sid_path` (item_id -> sid_0..sid_3).
-    They yield (query_embedding[512], target_sid_text). The LightningModule
-    builds the encoder input as
-        [W_q @ q + p_0, ..., W_q @ q + p_3, embed(<search>)]      (5 tokens)
-    so search-mode batches do NOT use `input_ids`.
-
-    A `RetrievalBatchSampler` (paired with this dataset) yields batches that
-    are uniformly one mode at a time (alternating). The collator inspects the
-    first row to decide which mode-specific output dict to build.
-
-    `__len__` is `2 * min(n_seq, n_search)` for an exact 50/50 split.
+    Even indices are sequence rows, odd indices are search rows. Pair with
+    `RetrievalBatchSampler` so each batch is uniform-mode. `__len__` is
+    `2 * min(n_seq, n_search)`.
     """
 
     def __init__(
@@ -158,7 +120,6 @@ class RetrievalDataset(Dataset):
         )
         self._rng = np.random.default_rng(seed)
 
-        # ---- Sequence-mode rows from cpt_corpus.parquet (behavior only).
         table = pq.read_table(str(self.corpus_path))
         seq_types = table.column("seq_type").to_pylist()
         inputs = table.column("input_text").to_pylist()
@@ -174,7 +135,6 @@ class RetrievalDataset(Dataset):
         self._seq_inputs = seq_inputs
         self._seq_targets = seq_targets
 
-        # ---- Search-mode rows: REQUIRE both embeddings and SID-keyed catalog.
         if self.embeddings_path is None:
             raise ValueError(
                 "embeddings_path is required for search-mode training. "
@@ -197,8 +157,6 @@ class RetrievalDataset(Dataset):
             columns=["item_id", "sid_0", "sid_1", "sid_2", "sid_3"],
         )
         sid_df = sid_table.to_pandas()
-        # Some rows may have NaN SIDs (items the RQ-VAE failed to assign).
-        # Drop those before building the lookup.
         sid_df = sid_df.dropna(subset=["sid_0", "sid_1", "sid_2", "sid_3"])
         sid_lookup: dict[int, str] = {
             int(row["item_id"]): _format_sid_target(
@@ -225,7 +183,6 @@ class RetrievalDataset(Dataset):
         self._search_embeddings = np.stack(kept_embeddings)
         self._search_targets = kept_targets
 
-        # ---- Stratify: choose n_each = min(n_seq, n_search) and sample without replacement.
         n_seq = len(self._seq_inputs)
         n_search = len(self._search_targets)
         n_each = min(n_seq, n_search)
@@ -238,15 +195,12 @@ class RetrievalDataset(Dataset):
 
     @property
     def search_mode(self) -> str:
-        """Always "embedding" — text fallback was removed in M3.7."""
         return "embedding"
 
     def __len__(self) -> int:
         return 2 * self._n_each
 
     def __getitem__(self, idx: int) -> dict:
-        # Even idx -> sequence mode, odd idx -> search mode (exact 50/50).
-        # Pair this with RetrievalBatchSampler to keep each batch uniform-mode.
         mode_is_seq = (idx % 2) == 0
         slot = idx // 2
         if mode_is_seq:
@@ -265,14 +219,9 @@ class RetrievalDataset(Dataset):
 
 
 class RetrievalBatchSampler:
-    """Yields batches whose samples share one mode.
+    """Alternating uniform-mode batches: even batch = sequence, odd = search.
 
-    Even-numbered batches are entirely sequence-mode (samples at even indices
-    of the dataset); odd-numbered batches are entirely search-mode (odd
-    indices). Within each pool we shuffle once per epoch for variety.
-
-    This pairs with RetrievalDataset's even=seq / odd=search index convention
-    and keeps the collator's job trivial (one mode per batch).
+    Pairs with RetrievalDataset's even=seq / odd=search index convention.
     """
 
     def __init__(
@@ -308,14 +257,14 @@ class RetrievalBatchSampler:
             rng.shuffle(seq_slots)
             rng.shuffle(search_slots)
 
-        # Convert slot -> dataset idx: seq slots map to even, search slots to odd.
         seq_indices = (seq_slots * 2).tolist()
         search_indices = (search_slots * 2 + 1).tolist()
 
         bs = self.batch_size
-        n_seq_batches = len(seq_indices) // bs if self.drop_last else (len(seq_indices) + bs - 1) // bs
-        n_search_batches = len(search_indices) // bs if self.drop_last else (len(search_indices) + bs - 1) // bs
-        n_pairs = min(n_seq_batches, n_search_batches)
+        if self.drop_last:
+            n_pairs = self.n_each // bs
+        else:
+            n_pairs = (self.n_each + bs - 1) // bs
 
         for b in range(n_pairs):
             yield seq_indices[b * bs : (b + 1) * bs]
@@ -325,21 +274,9 @@ class RetrievalBatchSampler:
 class RetrievalCollator:
     """Top-level callable so multi-worker DataLoader can pickle it on Windows.
 
-    Each batch is uniform-mode (RetrievalBatchSampler enforces this). The
-    output dict shape depends on the mode:
-
-      sequence-mode:
-        {"mode": "sequence",
-         "input_ids": LongTensor[B, T_in],
-         "attention_mask": LongTensor[B, T_in],
-         "labels": LongTensor[B, T_tgt]}
-
-      search-mode:
-        {"mode": "search",
-         "query_embeddings": FloatTensor[B, 512],
-         "labels": LongTensor[B, T_tgt]}
-
-    `labels` use -100 on pad in both modes (HF convention -> ignored by CE).
+    Sequence batch -> {input_ids, attention_mask, labels}.
+    Search batch -> {query_embeddings, labels}.
+    Pad positions in labels are set to -100.
     """
 
     def __init__(self, tokenizer, max_input_len: int = 512, max_target_len: int = 16):
@@ -377,7 +314,6 @@ class RetrievalCollator:
                 "attention_mask": enc["attention_mask"],
                 "labels": labels,
             }
-        # search mode.
         emb = torch.stack([b["query_embedding"] for b in batch])
         return {
             "mode": "search",

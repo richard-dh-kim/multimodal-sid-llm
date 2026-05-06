@@ -1,7 +1,4 @@
-"""Smoke test the beam-search retriever against the M3.5 init checkpoint.
-The init model isn't trained - it'll generate near-random SIDs - but the
-mechanics (constraint application, sid_to_item lookup, no crashes) must work.
-"""
+"""Smoke tests for BeamSearchRetriever against the M3.5 init checkpoint."""
 from pathlib import Path
 
 import pytest

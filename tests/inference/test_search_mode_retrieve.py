@@ -1,11 +1,4 @@
-"""CPU-only tests for BeamSearchRetriever search-mode (CLIP-embedding) inference.
-
-We build a tiny T5 + tokenizer in-memory, hand-craft a 3-SID Trie, attach a
-small `query_projection` and `soft_prompt_offsets`, and run beam search. The
-model is randomly initialized so we don't assert anything about *which* SID
-it picks — only that mechanics work and the search-mode codepath is actually
-being exercised (vs silently falling through to text mode).
-"""
+"""CPU tests for BeamSearchRetriever search-mode (CLIP-embedding) inference."""
 from __future__ import annotations
 
 import pytest
@@ -20,12 +13,11 @@ from sid_llm.inference.trie import SIDTrie
 D_MODEL = 64
 QUERY_DIM = 512
 NUM_SOFT = 4
-NUM_SIDS = 16  # tiny vocab segment for hand-crafted SID tokens
+NUM_SIDS = 16
 
 
 @pytest.fixture(scope="module")
 def tiny_retriever_components():
-    """Build a tiny T5 + tokenizer + Trie + sid_to_item suitable for retriever tests."""
     torch.manual_seed(0)
 
     cfg = T5Config(
@@ -51,14 +43,13 @@ def tiny_retriever_components():
     sid_token_ids = tok.convert_tokens_to_ids([f"<sid_{i}>" for i in range(NUM_SIDS)])
     sid_eos_id = tok.convert_tokens_to_ids("<sid_eos>")
 
-    # Three valid SIDs (all in codebook-index space, [0, NUM_SIDS)).
     sids = [
         (0, 1, 2, 3),
         (0, 1, 4, 5),
         (6, 7, 8, 9),
     ]
     trie = SIDTrie(sids, vocab_size=NUM_SIDS)
-    sid_to_item = {sid: i + 1000 for i, sid in enumerate(sids)}  # arbitrary item_ids
+    sid_to_item = {sid: i + 1000 for i, sid in enumerate(sids)}
 
     return {
         "model": model,
@@ -100,8 +91,6 @@ def _make_seqonly_retriever(comps) -> BeamSearchRetriever:
 
 
 def test_retrieve_from_query_embedding_returns_k_valid_sids(tiny_retriever_components):
-    """retrieve_from_query_embedding returns k results, all (c0,c1,c2,c3) tuples
-    that are present in the Trie when constrained=True."""
     retr = _make_search_retriever(tiny_retriever_components)
     valid = tiny_retriever_components["valid_sids"]
 
@@ -114,12 +103,10 @@ def test_retrieve_from_query_embedding_returns_k_valid_sids(tiny_retriever_compo
     assert len(item_ids) == 3
     assert len(sids) == 3
     for sid in sids:
-        # Constrained decoding must keep us inside the trie.
         assert sid in valid, f"constrained search-mode emitted invalid SID {sid}"
 
 
 def test_retrieve_from_query_embedding_batched(tiny_retriever_components):
-    """Batched [B, 512] input returns lists-of-lists shaped [B][k]."""
     retr = _make_search_retriever(tiny_retriever_components)
     valid = tiny_retriever_components["valid_sids"]
 
@@ -138,9 +125,6 @@ def test_retrieve_from_query_embedding_batched(tiny_retriever_components):
 
 
 def test_search_mode_unavailable_raises_clear_error(tiny_retriever_components):
-    """A retriever instantiated without soft-prompt artifacts must raise
-    RuntimeError on retrieve_from_query_embedding (rather than silently
-    falling back to text mode)."""
     retr = _make_seqonly_retriever(tiny_retriever_components)
     q = torch.randn(QUERY_DIM)
     with pytest.raises(RuntimeError, match=r"soft.prompt|soft_prompt"):
@@ -148,9 +132,6 @@ def test_search_mode_unavailable_raises_clear_error(tiny_retriever_components):
 
 
 def test_mismatched_query_dim_raises(tiny_retriever_components):
-    """If query_projection expects 512 but caller passes a 256-d embedding,
-    the linear should fail with a clear shape error rather than silently
-    producing garbage."""
     retr = _make_search_retriever(tiny_retriever_components, qp_in_features=512)
     bad_q = torch.randn(256)
     with pytest.raises((RuntimeError, ValueError)):
@@ -158,20 +139,13 @@ def test_mismatched_query_dim_raises(tiny_retriever_components):
 
 
 def test_search_mode_path_differs_from_text_mode(tiny_retriever_components):
-    """Most-important sanity: the search-mode codepath produces different
-    encoder inputs than text mode for the same target query, so the per-beam
-    scores (and therefore the ordering) should differ. This proves we are
-    actually feeding the soft-prompt + <search> embeddings, not silently
-    falling through to tokenizer-based text encoding.
+    """Search mode and text mode produce distinct encoder inputs.
 
-    We compare *raw beam scores* rather than just the top-K sids. With a tiny
-    trie of only 3 SIDs and constrained decoding, both codepaths might land on
-    the same top SID purely by luck, so we look at the underlying scores
-    instead.
+    Compares raw beam outputs rather than top-K SIDs because constrained
+    decoding over a 3-SID trie can collide by luck.
     """
     retr = _make_search_retriever(tiny_retriever_components)
 
-    # Run search mode.
     torch.manual_seed(7)
     q = torch.randn(QUERY_DIM)
     inputs_embeds, attn_search = retr._build_search_inputs_embeds(q.unsqueeze(0))
@@ -187,7 +161,6 @@ def test_search_mode_path_differs_from_text_mode(tiny_retriever_components):
         use_cache=True,
     )
 
-    # Run text mode with a benign string query as the comparison.
     enc = retr.tokenizer("a b c d e", return_tensors="pt").to("cpu")
     out_text = retr.model.generate(
         **enc,
@@ -200,9 +173,6 @@ def test_search_mode_path_differs_from_text_mode(tiny_retriever_components):
         use_cache=True,
     )
 
-    # Assert the encoder inputs differ (i.e. the codepaths are genuinely distinct).
-    # This is the key property: search mode goes through inputs_embeds + a 5-token
-    # encoder seq, while text mode goes through input_ids of arbitrary length.
     assert inputs_embeds.size(1) == 5, \
         "search-mode encoder input must be 5 tokens (4 soft + <search>)"
     assert enc["input_ids"].size(1) != 5 or not torch.equal(
@@ -211,8 +181,6 @@ def test_search_mode_path_differs_from_text_mode(tiny_retriever_components):
 
 
 def test_unconstrained_search_mode_still_runs(tiny_retriever_components):
-    """With constrained=False the model can emit anything; we just check the
-    call doesn't crash and returns the right number of results."""
     retr = _make_search_retriever(tiny_retriever_components)
     torch.manual_seed(3)
     q = torch.randn(QUERY_DIM)

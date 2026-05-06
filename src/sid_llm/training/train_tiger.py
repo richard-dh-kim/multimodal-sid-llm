@@ -1,11 +1,4 @@
-"""TIGER replication baseline (B3) trainer.
-
-Vanilla TIGER recipe over the SID corpus. Mirrors `train_cpt.py`'s memory
-hygiene (lazy PyArrow rows, top-level pickleable collator, HF safetensors save
-with `max_shard_size`, `enable_checkpointing=False` on the Lightning Trainer)
-so the same code path runs cleanly on both Linux GPU and a 16GB-RAM Windows
-box. See `src/sid_llm/models/tiger_baseline.py` for the architectural choices.
-"""
+"""TIGER replication baseline (B3) trainer."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -24,11 +17,10 @@ from sid_llm.models.tiger_baseline import build_tiger_baseline
 
 
 class TigerBehaviorDataset(Dataset):
-    """Reads cpt_corpus.parquet and yields (input_text, target_text) for behavior rows only.
+    """Yields (input_text, target_text) for behavior rows of cpt_corpus.parquet.
 
-    Filters lazily via PyArrow's `filter` kernel — does NOT materialize the table
-    into a Python list, so 300k-row corpora stay cheap on a 16GB box. Holds the
-    PyArrow columns directly in the same shape as `train_cpt.CPTSeqDataset`.
+    Filters lazily via PyArrow's `filter` kernel so 300k-row corpora stay
+    cheap on a 16GB box.
     """
 
     def __init__(self, corpus_path: Path):
@@ -60,11 +52,7 @@ def nullcontext():
 
 
 class T5Collator:
-    """Top-level callable so multi-worker DataLoader can pickle it on Windows.
-
-    Shape-identical to `train_cpt.T5Collator`; duplicated here intentionally so
-    the baseline can be deleted as a unit without touching the main trainer.
-    """
+    """Top-level callable so multi-worker DataLoader can pickle it on Windows."""
 
     def __init__(self, tokenizer, max_input_len: int = 512, max_target_len: int = 16):
         self.tokenizer = tokenizer
@@ -134,9 +122,7 @@ class TigerLightning(L.LightningModule):
         return out.loss
 
     def configure_optimizers(self):
-        # Plain AdamW — no AdamWAnchored. Betas (0.9, 0.98) match T5 / TIGER
-        # convention (a slightly higher beta2 than torch's 0.999 default; see
-        # T5 paper Appx D).
+        # Betas (0.9, 0.98) match the T5 paper (Appx D), not torch's (0.9, 0.999) default.
         optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.hparams.lr,
@@ -161,9 +147,7 @@ class TigerLightning(L.LightningModule):
 
 
 class HFSavePerEpoch(Callback):
-    """Save the underlying T5 + tokenizer at the end of every train epoch
-    in HF safetensors format. Mirrors the M3.6 callback so `sid_llm_eval`
-    can load this baseline through the same `--ckpt-dir` path."""
+    """Per-epoch HF safetensors save of T5 + tokenizer."""
 
     def __init__(self, ckpt_dir: Path):
         super().__init__()
@@ -272,10 +256,8 @@ def main(
 
     micro_batches_per_epoch = max(1, len(train_loader))
     opt_steps_per_epoch = max(1, micro_batches_per_epoch // max(1, accumulate_grad_batches))
-    # +epochs as a buffer: Lightning's optimizer-step counter can run one ahead
-    # of len(train_loader)//accum at each epoch boundary depending on grad-accum
-    # rounding. OneCycleLR raises if step_num exceeds total_steps. The buffer
-    # is small enough not to materially shift the LR curve.
+    # +epochs buffer: Lightning's optimizer-step counter can run one ahead of
+    # len/accum at each epoch boundary; OneCycleLR raises if step_num exceeds total_steps.
     total_steps = max_steps if max_steps > 0 else opt_steps_per_epoch * epochs + epochs
     model.hparams.total_steps = total_steps
 
@@ -293,10 +275,7 @@ def main(
         logger=logger,
         log_every_n_steps=20,
         enable_progress_bar=False,
-        # Same rationale as train_cpt.py: HFSavePerEpoch handles persistence
-        # via safetensors; Lightning's torch.save path trips on a Windows
-        # bf16 zip-alignment bug for some model sizes.
-        enable_checkpointing=False,
+        enable_checkpointing=False,  # HFSavePerEpoch handles persistence.
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)

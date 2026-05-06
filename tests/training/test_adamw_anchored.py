@@ -7,15 +7,12 @@ from sid_llm.training.optimizers import AdamWAnchored
 
 
 def test_decays_toward_init():
-    """With zero gradients, AdamWAnchored should pull weights toward the
-    captured init values (the anchor), not toward zero like vanilla AdamW would.
-    """
     torch.manual_seed(0)
     init_value = 5.0
     p = torch.nn.Parameter(torch.full((4,), init_value))
     opt = AdamWAnchored([p], lr=1e-1, weight_decay=1e-2)
 
-    # Perturb the parameter AFTER the optimizer captures the anchor.
+    # Perturb after the optimizer captures the anchor.
     with torch.no_grad():
         p.add_(torch.tensor([1.0, -1.0, 2.0, -2.0]))
 
@@ -24,17 +21,13 @@ def test_decays_toward_init():
     assert torch.equal(init_anchor, torch.full((4,), init_value)), \
         "Anchor must equal init value, not the perturbed value."
 
-    # Drive a few zero-gradient optimizer steps.
     for _ in range(50):
-        # No-op forward; emulate a zero-grad backward by setting grads to zero.
         if p.grad is None:
             p.grad = torch.zeros_like(p)
         else:
             p.grad.zero_()
         opt.step()
 
-    # Distance to init should have shrunk; distance to zero should have grown
-    # (since we are NOT pulling toward zero).
     d_init_before = (perturbed - init_anchor).abs().sum().item()
     d_init_after = (p.detach() - init_anchor).abs().sum().item()
     d_zero_before = perturbed.abs().sum().item()
@@ -44,16 +37,13 @@ def test_decays_toward_init():
         f"Weights should drift toward theta_init. "
         f"d_init_before={d_init_before:.4f} d_init_after={d_init_after:.4f}"
     )
-    # Vanilla AdamW would have shrunk d_zero. AdamWAnchored should not.
-    # We don't require d_zero strictly increases (it might tie if init is small),
-    # but it MUST NOT shrink toward zero faster than toward init.
+    # Vanilla AdamW would shrink d_zero; AdamWAnchored should not.
     assert d_zero_after >= d_zero_before * 0.95, (
         f"Weights should NOT decay toward zero. "
         f"d_zero_before={d_zero_before:.4f} d_zero_after={d_zero_after:.4f}"
     )
 
-    # Also check parameter sign is preserved per-coordinate (init=5, perturbed
-    # values are 6, 4, 7, 3 -> all positive; should stay positive and approach 5).
+    # Init=5, perturbed=[6,4,7,3]; all should stay positive and approach 5.
     expected_signs = torch.tensor([1.0, 1.0, 1.0, 1.0])
     actual_signs = torch.sign(p.detach())
     assert torch.equal(actual_signs, expected_signs), \
@@ -61,11 +51,9 @@ def test_decays_toward_init():
 
 
 def test_step_with_gradient_does_descent():
-    """Sanity: with a real gradient signal AdamWAnchored still does a
-    gradient descent step (the Adam term works), not just anchor decay."""
     torch.manual_seed(0)
     p = torch.nn.Parameter(torch.tensor([1.0, 1.0]))
-    opt = AdamWAnchored([p], lr=1e-1, weight_decay=0.0)  # decay off, isolate Adam term
+    opt = AdamWAnchored([p], lr=1e-1, weight_decay=0.0)
     target = torch.tensor([0.0, 0.0])
 
     for _ in range(100):
@@ -79,11 +67,9 @@ def test_step_with_gradient_does_descent():
 
 
 def test_anchor_captured_before_first_step():
-    """The anchor must be set at construction, not at first step()."""
     p = torch.nn.Parameter(torch.tensor([3.0, 3.0]))
     opt = AdamWAnchored([p], lr=1e-2)
     captured = opt.state[p]["theta_init"]
-    # Mutate p; anchor must not move.
     with torch.no_grad():
         p.fill_(99.0)
     assert torch.equal(captured, torch.tensor([3.0, 3.0]))

@@ -1,4 +1,4 @@
-"""High-level wrapper around HF model.generate() for SID-LLM retrieval."""
+"""Beam-search retriever for SID-LLM: text or query-embedding -> top-K item ids."""
 from __future__ import annotations
 
 import warnings
@@ -13,15 +13,10 @@ from sid_llm.inference.logits_processor import TrieConstrainedSIDProcessor
 
 
 class BeamSearchRetriever:
-    """Wraps a T5 model + tokenizer + Trie + sid_to_item for generative retrieval.
+    """T5 + tokenizer + Trie + sid_to_item wrapped for generative retrieval.
 
-    The model is expected to have been CPT'd (M3.6) and fine-tuned (M3.7) so that
-    generated tokens are real SID tokens. With the M3.5 init checkpoint, generation
-    will be near-random - useful only for testing the mechanics.
-
-    Optional search-mode capability: if `query_projection` and `soft_prompt_offsets`
-    are passed, `retrieve_from_query_embedding` becomes available and runs the same
-    soft-prompt + <search> encoder-input construction used by M3.7 training.
+    Pass `query_projection` and `soft_prompt_offsets` together to enable
+    `retrieve_from_query_embedding`; otherwise only `retrieve_from_text` works.
     """
 
     def __init__(
@@ -48,9 +43,6 @@ class BeamSearchRetriever:
             tid: i for i, tid in enumerate(sid_token_ids)
         }
 
-        # Optional search-mode soft-prompt parameters. They live on the retriever
-        # rather than the model because T5ForConditionalGeneration has no slot for
-        # them; their math (soft = W_q @ q + p_i) mirrors RetrievalLightning's.
         self.query_projection: nn.Linear | None = None
         self.soft_prompt_offsets: torch.Tensor | None = None
         if query_projection is not None and soft_prompt_offsets is not None:
@@ -60,27 +52,23 @@ class BeamSearchRetriever:
                 offsets = offsets.data
             self.soft_prompt_offsets = offsets.detach().to(self.device)
         elif (query_projection is None) != (soft_prompt_offsets is None):
-            # Provide the user a clear signal rather than a silent dimension bug.
             raise ValueError(
                 "query_projection and soft_prompt_offsets must be provided together "
                 "(or both omitted) to enable search-mode retrieval."
             )
 
-        # Resolve <search> token id once. Unknown if vocab does not contain it.
         search_id = self.tokenizer.convert_tokens_to_ids("<search>")
         self._search_token_id: int | None = (
             search_id if search_id != self.tokenizer.unk_token_id else None
         )
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
     def _decode_sid_tuples_from_sequences(
         self, sequences: torch.LongTensor
     ) -> list[tuple[int, int, int, int]]:
-        """`sequences` shape [B*K, T]. Strip decoder_start_token + eos and translate
-        to (cb_idx_0, cb_idx_1, cb_idx_2, cb_idx_3) tuples. Sequences shorter than
-        4 SID tokens get padded with -1 (which won't match any sid_to_item key).
+        """[B*K, T] decoder sequences -> (cb_0, cb_1, cb_2, cb_3) per row.
+
+        Rows shorter than 4 SID tokens get padded with -1 so they miss the
+        sid_to_item lookup.
         """
         out: list[tuple[int, int, int, int]] = []
         for row in sequences.tolist():
@@ -98,37 +86,27 @@ class BeamSearchRetriever:
     def _build_search_inputs_embeds(
         self, query_embed: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """[B, 512] -> (inputs_embeds[B, 5, d_model], attention_mask[B, 5]).
-
-        Mirrors `RetrievalLightning._search_forward` exactly so train/inference
-        agree on the encoder input layout. Caller is responsible for ensuring
-        search-mode is configured.
-        """
+        """[B, query_dim] -> (inputs_embeds[B, N+1, d_model], attention_mask[B, N+1])."""
         assert self.query_projection is not None
         assert self.soft_prompt_offsets is not None
         assert self._search_token_id is not None
 
         b = query_embed.size(0)
-        # [B, d_model]
         projected = self.query_projection(query_embed)
-        # [B, 1, d_model] + [N, d_model] -> [B, N, d_model]; broadcast offsets across batch.
         soft = projected.unsqueeze(1) + self.soft_prompt_offsets.unsqueeze(0)
 
         search_ids = torch.full(
             (b, 1), fill_value=self._search_token_id, dtype=torch.long, device=self.device
         )
-        search_emb = self.model.shared(search_ids)            # [B, 1, d_model]
-        # Cast soft to match T5's embedding dtype so concat doesn't blow up under bf16/fp16.
+        search_emb = self.model.shared(search_ids)
+        # Cast soft to embedding dtype so concat works under bf16/fp16.
         soft = soft.to(search_emb.dtype)
-        inputs_embeds = torch.cat([soft, search_emb], dim=1)  # [B, 5, d_model]
+        inputs_embeds = torch.cat([soft, search_emb], dim=1)
         attention_mask = torch.ones(
             (b, inputs_embeds.size(1)), dtype=torch.long, device=self.device
         )
         return inputs_embeds, attention_mask
 
-    # ------------------------------------------------------------------
-    # Public retrieval entrypoints
-    # ------------------------------------------------------------------
     @torch.no_grad()
     def retrieve_from_text(
         self,
@@ -139,8 +117,8 @@ class BeamSearchRetriever:
     ) -> tuple[list[int], list[tuple[int, int, int, int]]]:
         """Encode query, beam-search top-K SID sequences, map to item_ids.
 
-        Returns (item_ids, sid_tuples) - both length up to k. Order is by beam score (best first).
-        Items that fail dict lookup get item_id -1 (silent miss).
+        Returns (item_ids, sid_tuples), both length k, ordered by beam score.
+        Lookup misses become item_id=-1.
         """
         num_beams = num_beams or max(k, 4)
         enc = self.tokenizer(query_text, return_tensors="pt", truncation=True, max_length=512).to(self.device)
@@ -155,13 +133,13 @@ class BeamSearchRetriever:
 
         out = self.model.generate(
             **enc,
-            max_new_tokens=5,  # 4 SID tokens + maybe eos
+            max_new_tokens=5,
             num_beams=num_beams,
             num_return_sequences=k,
             do_sample=False,
             logits_processor=logits_processors if constrained else LogitsProcessorList(),
             return_dict_in_generate=True,
-            use_cache=True,  # KV cache enabled
+            use_cache=True,
         )
 
         sid_tuples = self._decode_sid_tuples_from_sequences(out.sequences)
@@ -179,18 +157,10 @@ class BeamSearchRetriever:
         tuple[list[int], list[tuple[int, int, int, int]]]
         | tuple[list[list[int]], list[list[tuple[int, int, int, int]]]]
     ):
-        """Search-mode retrieval. Build the soft-prompt + <search> encoder input
-        from a CLIP query embedding, then beam-search top-K SID sequences.
+        """Search-mode beam search from a CLIP query embedding.
 
-        Args:
-            query_embed: [512] (single query) or [B, 512] (batched). Float tensor.
-            k: number of beams to return per query.
-            num_beams: beam width; defaults to max(k, 4).
-            constrained: if True, apply Trie-based logits processor.
-
-        Returns:
-            For 1D input: (item_ids, sid_tuples) — same shape as `retrieve_from_text`.
-            For 2D input: (list_of_item_ids, list_of_sid_tuples), one entry per query.
+        query_embed of shape [D] returns (item_ids, sid_tuples) of length k.
+        Shape [B, D] returns lists-of-lists, one per query.
         """
         if self.query_projection is None or self.soft_prompt_offsets is None:
             raise RuntimeError(
@@ -209,11 +179,9 @@ class BeamSearchRetriever:
             query_embed = query_embed.unsqueeze(0)
         if query_embed.dim() != 2:
             raise ValueError(
-                f"query_embed must be [512] or [B, 512]; got shape {tuple(query_embed.shape)}"
+                f"query_embed must be 1D or 2D; got shape {tuple(query_embed.shape)}"
             )
 
-        # Cast / move to match query_projection params before the linear; this also
-        # surfaces dim mismatches as a clear error from nn.Linear.
         target_dtype = self.query_projection.weight.dtype
         query_embed = query_embed.to(device=self.device, dtype=target_dtype)
 
@@ -241,7 +209,6 @@ class BeamSearchRetriever:
             use_cache=True,
         )
 
-        # `out.sequences` is [B*k, T_dec]. Decode each row, then group by query.
         all_sids = self._decode_sid_tuples_from_sequences(out.sequences)
         all_items = [self.sid_to_item.get(t, -1) for t in all_sids]
 
@@ -264,19 +231,11 @@ def load_retriever(
     soft_prompt_path: Path | None = None,
     device: str | None = None,
 ) -> BeamSearchRetriever:
-    """Load a SID-LLM checkpoint + the M3.4 lookup artifacts.
+    """Load a SID-LLM checkpoint plus catalog lookup artifacts.
 
-    If a `soft_prompt.pt` is present (either at the explicit `soft_prompt_path`
-    or at `<ckpt_dir>/soft_prompt.pt`), the returned retriever has search-mode
-    enabled. Otherwise it is sequence-mode only and `retrieve_from_query_embedding`
-    will raise a clear `RuntimeError`.
-
-    The expected on-disk layout for `soft_prompt.pt` matches what
-    `train_retrieval.HFSavePerEpoch` writes:
-        {
-          "query_projection.state_dict": OrderedDict({weight, bias}),
-          "soft_prompt_offsets": Tensor[N, d_model],
-        }
+    If `soft_prompt.pt` is at `soft_prompt_path` (default
+    `<ckpt_dir>/soft_prompt.pt`), the retriever supports search mode. Otherwise
+    `retrieve_from_query_embedding` will raise.
     """
     import pickle
 
@@ -289,14 +248,11 @@ def load_retriever(
     with open(sid_trie_path, "rb") as f:
         trie: SIDTrie = pickle.load(f)
 
-    # Resolve sid_token_ids from the tokenizer (preferred) or soft_prompt extras.
     sid_token_ids = tokenizer.convert_tokens_to_ids(
         [f"<sid_{i}>" for i in range(1024)]
     )
     sid_eos_id = tokenizer.convert_tokens_to_ids("<sid_eos>")
 
-    # Try to load soft-prompt artifacts. Default to <ckpt_dir>/soft_prompt.pt
-    # if no explicit path was given. Missing -> sequence-mode only retriever.
     qp: nn.Linear | None = None
     offsets: torch.Tensor | None = None
     sp_path = Path(soft_prompt_path) if soft_prompt_path is not None else (ckpt_dir / "soft_prompt.pt")
@@ -318,7 +274,6 @@ def load_retriever(
                 stacklevel=2,
             )
     elif soft_prompt_path is not None:
-        # User explicitly asked for a soft-prompt file but it's missing.
         warnings.warn(
             f"soft_prompt path {sp_path} not found; loading retriever in "
             "sequence-mode only.",

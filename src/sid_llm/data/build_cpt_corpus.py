@@ -31,7 +31,7 @@ DEFAULT_BEHAVIOR_USERS = 150_000
 
 
 def build_metadata_sequence(item: dict) -> tuple[str, str]:
-    """One (input_text, target_text) pair from a single catalog item with a SID."""
+    """(input_text, target_text) for one catalog item with a SID."""
     title = (item.get("title") or "").strip()
     sub_cat = (item.get("sub_category") or "").strip() or "unknown"
     desc = clean_text(item.get("description"), max_chars=DESC_MAX_CHARS)
@@ -83,7 +83,6 @@ def aggregate_user_events(
     out: dict[str, list[tuple[int, int, int, int]]] = {}
     for uid, events in by_user.items():
         events.sort(key=lambda x: x[0])
-        # Cap to last `cap` events (most recent).
         if len(events) > cap:
             events = events[-cap:]
         out[uid] = [sid for _, sid in events]
@@ -122,7 +121,6 @@ def main(
     ]
     print(f"  catalog={catalog.num_rows:,}, with SIDs={len(items_with_sid):,}")
 
-    # ---- Metadata sequences (one per item with SID) ----
     print("Building metadata sequences ...")
     meta_rows = []
     for it in items_with_sid:
@@ -130,14 +128,12 @@ def main(
         meta_rows.append({"seq_type": "metadata", "input_text": inp, "target_text": tgt})
     print(f"  {len(meta_rows):,} metadata rows")
 
-    # ---- Behavior sequences ----
     print("Building behavior sequences ...")
-    print(f"  loading interactions ...")
     asin_to_sid: dict[str, tuple[int, int, int, int]] = {}
     for it in items_with_sid:
         asin_to_sid[it["parent_asin"]] = tuple(int(it[f"sid_{i}"]) for i in range(4))
 
-    # Iterate in batches to avoid materializing all 11.8M interactions in Python at once.
+    # Stream batches; full interactions table doesn't fit in 16GB.
     pf = pq.ParquetFile(str(interactions_in))
     total_rows = pf.metadata.num_rows
     print(f"  {total_rows:,} raw interactions (streaming in batches)")
@@ -163,11 +159,9 @@ def main(
         if len(events) > user_history_cap:
             events = events[-user_history_cap:]
         user_chains[uid] = [sid for _, sid in events]
-    # Free the intermediate map.
     del by_user
     print(f"  {len(user_chains):,} users with at least one catalog-resolved event")
 
-    # Sample down to max_behavior_users (random subset of users with >= 2 events).
     eligible = [uid for uid, chain in user_chains.items() if len(chain) >= 2]
     print(f"  {len(eligible):,} users with >= 2 events")
     if len(eligible) > max_behavior_users:
@@ -182,7 +176,6 @@ def main(
         behav_rows.append({"seq_type": "behavior", "input_text": inp, "target_text": tgt})
     print(f"  {len(behav_rows):,} behavior rows")
 
-    # ---- Mix + shuffle ----
     all_rows = meta_rows + behav_rows
     rng.shuffle(all_rows)
     print(f"\nTotal corpus: {len(all_rows):,} rows ({len(meta_rows):,} metadata + {len(behav_rows):,} behavior)")

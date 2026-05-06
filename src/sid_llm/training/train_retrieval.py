@@ -1,18 +1,8 @@
-"""Generative-retrieval fine-tune (M3.7).
+"""Generative-retrieval fine-tune CLI: stratified 50/50 sequence + search mode on a CPT'd T5.
 
-Loads the CPT'd checkpoint (M3.6) and trains it on a stratified 50/50 mix of
-sequence-mode and search-mode examples. Optionally uses AdamWAnchored to
-L2-SP-regularize toward the CPT init weights so the fine-tune doesn't forget.
-
-Search-mode forward pass (per the spec):
-    soft   = W_q @ q + p_i           (4 virtual encoder tokens, [B, 4, d_model])
-    search = embed(<search>)         ([B, 1, d_model])
-    inputs_embeds = concat([soft, search], dim=1)   ([B, 5, d_model])
-    out    = T5(inputs_embeds=..., attention_mask=ones(B,5), labels=...)
-
-W_q, p_i are initialized from `checkpoints/sid_llm/init/soft_prompt.pt` (M3.5
-output) when available. Sequence-mode batches go through the standard
-`input_ids`/`attention_mask` path.
+Search-mode encoder input is `[W_q @ q + p_i (i=0..3), embed(<search>)]` (5 tokens).
+Sequence-mode goes through the normal input_ids path. Optional AdamWAnchored
+L2-SP-regularizes toward the init weights.
 """
 from __future__ import annotations
 
@@ -36,19 +26,13 @@ from sid_llm.training.datasets import (
 from sid_llm.training.optimizers import AdamWAnchored
 
 
-# Must match the constants in sid_llm.models.sid_llm. Hard-coding rather than
-# importing to keep this file dependency-light at test time.
+# Mirrors sid_llm.models.sid_llm; duplicated to avoid the import at test time.
 QUERY_EMBED_DIM = 512
 NUM_SOFT_PROMPT_TOKENS = 4
 
 
 class _SubsetWithLen(Subset):
-    """Subset that exposes the underlying dataset's `_n_each` if present.
-
-    RetrievalBatchSampler needs the number of (seq, search) pairs in a *split*,
-    not the full dataset. We compute that by counting even/odd indices in the
-    Subset's `indices` list.
-    """
+    """Subset that exposes `n_each` (min of even/odd indices) for RetrievalBatchSampler."""
 
     @property
     def n_each(self) -> int:
@@ -60,9 +44,9 @@ class _SubsetWithLen(Subset):
 class RetrievalLightning(L.LightningModule):
     """T5 generative retrieval fine-tune with search-mode soft-prompt fusion.
 
-    Owns the soft-prompt projection (W_q: 512->768) and learned per-position
-    offsets (p_i: [4, 768]). Initializes them from `soft_prompt_path` when
-    that file exists; otherwise warns and falls back to small random init.
+    Owns the soft-prompt projection W_q: query_embed_dim -> d_model and the
+    learned per-position offsets p_i: [N, d_model]. Loaded from
+    `soft_prompt_path` when present; otherwise small random init.
     """
 
     def __init__(
@@ -92,16 +76,13 @@ class RetrievalLightning(L.LightningModule):
             torch.randn(NUM_SOFT_PROMPT_TOKENS, d_model) * new_init_noise
         )
 
-        # Resolve the <search> token id. The M3.5 init script adds <search>
-        # to the tokenizer; if for any reason it's missing here we fall back
-        # to <seq> with a loud warning so the run still completes.
         self._search_token_id = self.tokenizer.convert_tokens_to_ids("<search>")
         if self._search_token_id == self.tokenizer.unk_token_id:
+            # Fall back to <seq> rather than crash; init pipeline is supposed to add <search>.
             seq_id = self.tokenizer.convert_tokens_to_ids("<seq>")
             warnings.warn(
                 "<search> token is not in the tokenizer vocab. Falling back "
-                "to <seq>'s embedding for the mode marker. This is a "
-                "regression — verify M3.5 init pipeline.",
+                "to <seq>'s embedding for the mode marker.",
                 stacklevel=2,
             )
             self._search_token_id = seq_id
@@ -109,20 +90,8 @@ class RetrievalLightning(L.LightningModule):
         if soft_prompt_path is not None:
             self._load_soft_prompt(Path(soft_prompt_path))
 
-    # ------------------------------------------------------------------
-    # Soft-prompt init/load helpers
-    # ------------------------------------------------------------------
     def _load_soft_prompt(self, path: Path) -> None:
-        """Load `query_projection` weight/bias and `soft_prompt_offsets` from
-        the M3.5 init dict at `path`. Missing file -> warn and keep random init.
-
-        The expected on-disk layout (matching `init_sid_llm.py`):
-            {
-              "query_projection.state_dict": OrderedDict({weight, bias}),
-              "soft_prompt_offsets": Tensor[4, 768],
-              ... (other metadata fields ignored)
-            }
-        """
+        """Load query_projection + soft_prompt_offsets from `path`. Missing -> warn, keep random init."""
         if not path.exists():
             warnings.warn(
                 f"soft_prompt path {path} not found; using random init for "
@@ -133,8 +102,6 @@ class RetrievalLightning(L.LightningModule):
         sd = torch.load(str(path), map_location="cpu", weights_only=False)
         qp = sd.get("query_projection.state_dict")
         if qp is not None:
-            # Direct assignment so this works even if shapes shifted (e.g.
-            # different d_model). Fail loudly on shape mismatch.
             self.query_projection.load_state_dict(qp)
         else:
             warnings.warn(
@@ -153,27 +120,25 @@ class RetrievalLightning(L.LightningModule):
                 stacklevel=2,
             )
 
-    # ------------------------------------------------------------------
-    # Forward dispatch
-    # ------------------------------------------------------------------
     def soft_prompt_from_query(self, query_embed: torch.Tensor) -> torch.Tensor:
-        """[B, 512] -> [B, 4, d_model], identical math to SIDLLMLightning."""
-        projected = self.query_projection(query_embed)        # [B, d_model]
+        """[B, query_embed_dim] -> [B, N, d_model]."""
+        projected = self.query_projection(query_embed)
         return projected.unsqueeze(1) + self.soft_prompt_offsets.unsqueeze(0)
 
     def _search_forward(self, query_embed: torch.Tensor, labels: torch.Tensor):
-        """Build the 5-token encoder input and run the T5 forward."""
         b = query_embed.size(0)
         device = query_embed.device
 
-        soft = self.soft_prompt_from_query(query_embed)       # [B, 4, d_model]
+        soft = self.soft_prompt_from_query(query_embed)
 
         search_ids = torch.full(
             (b, 1), fill_value=self._search_token_id, dtype=torch.long, device=device
         )
-        search_emb = self.model.shared(search_ids)            # [B, 1, d_model]
+        search_emb = self.model.shared(search_ids)
+        # Cast soft to embedding dtype so concat works under bf16/fp16.
+        soft = soft.to(search_emb.dtype)
 
-        inputs_embeds = torch.cat([soft, search_emb], dim=1)  # [B, 5, d_model]
+        inputs_embeds = torch.cat([soft, search_emb], dim=1)
         attention_mask = torch.ones(
             (b, inputs_embeds.size(1)), dtype=torch.long, device=device
         )
@@ -201,8 +166,6 @@ class RetrievalLightning(L.LightningModule):
         else:
             raise ValueError(f"Unknown batch mode {mode!r}")
 
-        # Per-mode loss logging is handy for diagnosing whether one path is
-        # diverging while the other trains fine.
         log_kw = dict(on_step=(stage == "train"), on_epoch=True, batch_size=bs)
         self.log(f"{stage}_loss", out.loss, prog_bar=True, **log_kw)
         self.log(f"{stage}_loss_{mode}", out.loss, **log_kw)
@@ -215,9 +178,8 @@ class RetrievalLightning(L.LightningModule):
         return self._step(batch, "val")
 
     def configure_optimizers(self):
-        # ALL trainable params, not just self.model.parameters() — soft-prompt
-        # params live on `self`, not on `self.model`, so they would otherwise
-        # be excluded from the optimizer.
+        # self.parameters() (not self.model.parameters()) so query_projection
+        # and soft_prompt_offsets get optimized too.
         params = list(self.parameters())
         if self.hparams.use_anchored:
             optimizer = AdamWAnchored(
@@ -251,14 +213,7 @@ class RetrievalLightning(L.LightningModule):
 
 
 class HFSavePerEpoch(Callback):
-    """Save the underlying T5 + tokenizer at the end of every train epoch
-    in HF safetensors format. Mirrors the M3.6 callback so downstream tools
-    (beam_search, eval) can reuse the same load path.
-
-    Also writes `soft_prompt.pt` alongside the HF model so search-mode
-    inference can reload the soft-prompt projection. Same key layout as the
-    M3.5 init file.
-    """
+    """Per-epoch HF safetensors save of T5 + tokenizer + soft_prompt.pt."""
 
     def __init__(self, ckpt_dir: Path):
         super().__init__()
@@ -367,9 +322,8 @@ def main(
     n = len(full)
     print(f"  {n:,} rows  (search_mode={full.search_mode})")
 
+    # Last n_val rows alternate seq/search and stay mode-balanced.
     n_val = max(2, int(n * val_frac))
-    # Keep val/train disjoint AND mode-balanced: val is the last n_val rows
-    # (which alternate seq/search, so the slice is balanced too).
     n_train = n - n_val
     train_idxs = list(range(n_train))
     val_idxs = list(range(n_train, n))
@@ -396,8 +350,6 @@ def main(
         model.tokenizer, max_input_len=max_input_len, max_target_len=max_target_len
     )
 
-    # RetrievalBatchSampler emits batches per (seq, search) pair, so the
-    # micro-batch count per epoch is 2x the number of pairs.
     train_sampler = RetrievalBatchSampler(
         n_each=train_ds.n_each, batch_size=batch_size, shuffle=True, seed=seed,
         drop_last=True,
@@ -418,7 +370,9 @@ def main(
 
     micro_batches_per_epoch = max(1, len(train_sampler))
     opt_steps_per_epoch = max(1, micro_batches_per_epoch // max(1, accumulate_grad_batches))
-    total_steps = max_steps if max_steps > 0 else opt_steps_per_epoch * epochs
+    # +epochs buffer: Lightning's optimizer-step counter can run one ahead of
+    # len/accum at each epoch boundary; OneCycleLR raises if step_num exceeds total_steps.
+    total_steps = max_steps if max_steps > 0 else opt_steps_per_epoch * epochs + epochs
     model.hparams.total_steps = total_steps
 
     callbacks = [HFSavePerEpoch(ckpt_dir)]
@@ -435,8 +389,7 @@ def main(
         logger=logger,
         log_every_n_steps=20,
         enable_progress_bar=False,
-        # Disable Lightning auto-checkpointing; HFSavePerEpoch handles persistence.
-        enable_checkpointing=False,
+        enable_checkpointing=False,  # HFSavePerEpoch handles persistence.
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)

@@ -71,7 +71,6 @@ class T5Collator:
                 max_length=self.max_target_len,
             )
         labels = tgt["input_ids"].clone()
-        # T5 ignores -100 in labels (standard PAD-masking convention).
         labels[labels == self.tokenizer.pad_token_id] = -100
         return {
             "input_ids": enc["input_ids"],
@@ -154,10 +153,8 @@ class HFSavePerEpoch(Callback):
         self._best_loss: float = float("inf")
 
     def on_train_epoch_end(self, trainer, pl_module):
-        # max_shard_size limits the peak bytes() allocation per shard.
-        # Without it, safetensors._tobytes() copies the full 894MB state in one
-        # allocation and on a 16GB-RAM Windows box (with optimizer state + dataset
-        # already resident) that can OOM.
+        # max_shard_size caps peak bytes() per shard; otherwise safetensors._tobytes()
+        # copies the full 894MB state in one alloc and OOMs on a 16GB Windows box.
         save_kwargs = {"max_shard_size": "200MB"}
         latest = self.ckpt_dir / "hf_latest"
         latest.mkdir(parents=True, exist_ok=True)
@@ -249,8 +246,7 @@ def main(
         collate_fn=collate, pin_memory=True, persistent_workers=(num_workers > 0),
     )
 
-    # Optimizer steps (= scheduler steps), not micro-batches. With grad accum,
-    # one optimizer step consumes accumulate_grad_batches dataloader iterations.
+    # Scheduler steps = optimizer steps, not micro-batches.
     micro_batches_per_epoch = max(1, len(train_loader))
     opt_steps_per_epoch = max(1, micro_batches_per_epoch // max(1, accumulate_grad_batches))
     total_steps = max_steps if max_steps > 0 else opt_steps_per_epoch * epochs
